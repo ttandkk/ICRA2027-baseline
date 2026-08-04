@@ -1,0 +1,9 @@
+torch==2.11.0
+torchvision==0.26.0
+lerobot==0.5.2
+diffusers==0.35.2
+accelerate==1.14.0
+transformers==5.5.4
+datasets==4.8.5
+pyarrow==24.0.0
+wandb==0.27.2

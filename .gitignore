@@ -1,0 +1,35 @@
+# Local environments and generated Python files
+.conda/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+
+# Experiment artifacts
+logs/
+**/logs/
+**/wandb/
+**/runs/
+**/train_outputs/
+**/eval_outputs/
+**/benchmark_outputs/
+**/outputs/
+**/results/
+**/eval_logs/
+
+# Downloaded data and models
+**/data/
+**/demo_data/
+**/pretrained/
+**/pretrained_models/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.safetensors
+**/*.bin
+
+# Editor and cache files
+.vscode/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.DS_Store

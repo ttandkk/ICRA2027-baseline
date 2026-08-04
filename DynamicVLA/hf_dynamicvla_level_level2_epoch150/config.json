@@ -1,0 +1,103 @@
+{
+    "type": "dynamicvla",
+    "n_obs_steps": 2,
+    "normalization_mapping": {
+        "VISUAL": "IDENTITY",
+        "STATE": "MEAN_STD",
+        "ACTION": "MEAN_STD"
+    },
+    "input_features": {
+        "observation.state": {
+            "type": "STATE",
+            "shape": [
+                10
+            ]
+        },
+        "observation.images.opst_cam": {
+            "type": "VISUAL",
+            "shape": [
+                3,
+                240,
+                320
+            ]
+        },
+        "observation.images.wrist_cam": {
+            "type": "VISUAL",
+            "shape": [
+                3,
+                160,
+                160
+            ]
+        }
+    },
+    "output_features": {
+        "action": {
+            "type": "ACTION",
+            "shape": [
+                10
+            ]
+        }
+    },
+    "device": "cuda",
+    "use_amp": false,
+    "push_to_hub": true,
+    "repo_id": null,
+    "private": null,
+    "tags": null,
+    "license": null,
+    "chunk_size": 20,
+    "n_action_steps": 20,
+    "max_state_dim": 32,
+    "max_action_dim": 32,
+    "resize_imgs_with_padding": [
+        384,
+        384
+    ],
+    "empty_cameras": 0,
+    "adapt_to_pi_aloha": false,
+    "use_delta_joint_actions_aloha": false,
+    "use_delta_action": true,
+    "enable_streaming": false,
+    "temporal_fusion": "attn",
+    "tokenizer_max_length": 48,
+    "num_steps": 10,
+    "use_cache": true,
+    "freeze_vision_model": true,
+    "freeze_connector": true,
+    "freeze_text_model": true,
+    "train_state_proj": true,
+    "optimizer_lr": 0.0001,
+    "optimizer_betas": [
+        0.9,
+        0.95
+    ],
+    "optimizer_eps": 1e-08,
+    "optimizer_weight_decay": 1e-10,
+    "optimizer_grad_clip_norm": 10,
+    "scheduler_warmup_steps": 1000,
+    "scheduler_decay_steps": 30000,
+    "scheduler_decay_lr": 2.5e-06,
+    "attention_mode": "cross_attn",
+    "prefix_length": -1,
+    "pad_language_to": "longest",
+    "num_expert_layers": -1,
+    "num_expert_skip_layers": 0,
+    "vlm_model_name": "HuggingFaceTB/SmolLM2-360M",
+    "num_vlm_layers": 16,
+    "smolvlm_patch_size": 16,
+    "smolvlm_attention_heads": 12,
+    "smolvlm_hidden_size": 768,
+    "smolvlm_intermediate_size": 3072,
+    "fastvlm_inference_mode": true,
+    "self_attn_every_n_layers": 2,
+    "expert_width_multiplier": 0.75,
+    "min_period": 0.004,
+    "max_period": 4.0,
+    "delta_timestamps": {
+        "observation": [
+            -2,
+            0
+        ]
+    },
+    "epoch": 150
+}

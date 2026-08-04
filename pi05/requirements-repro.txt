@@ -1,0 +1,10 @@
+torch==2.11.0
+torchvision==0.26.0
+lerobot==0.5.2
+accelerate==1.14.0
+transformers==5.5.4
+datasets==4.8.5
+hf_libero==0.1.4
+robosuite==1.4.0
+mujoco==3.8.1
+wandb==0.27.2
