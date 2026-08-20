@@ -30,8 +30,8 @@ from openpi_client import image_tools
 _SLIDING_CACHE_SAMPLE_SEMANTICS = "sliding_chunk_shift"
 
 
-def _chw01_to_hwc_uint8(x: torch.Tensor) -> np.ndarray:
-    x = x.detach().to(dtype=torch.float32).clamp(0.0, 1.0)
+def _chw01_to_hwc_uint8(x: torch.Tensor | np.ndarray) -> np.ndarray:
+    x = torch.as_tensor(x).detach().to(dtype=torch.float32).clamp(0.0, 1.0)
     x_u8 = (x * 255.0).round().to(dtype=torch.uint8)
     return x_u8.permute(1, 2, 0).cpu().numpy()
 

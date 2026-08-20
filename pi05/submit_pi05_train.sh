@@ -2,8 +2,8 @@
 
 # --- Slurm config ---
 #SBATCH --job-name=pi05_train
-#SBATCH --output=/projects/hdd/ssd/ICLR2027/baseline/pi05/logs/pi05_train_%j.log
-#SBATCH --error=/projects/hdd/ssd/ICLR2027/baseline/pi05/logs/pi05_train_%j.err
+#SBATCH --output=/projects/haitian003ssd/ICRA2027-baseline/pi05/logs/pi05_train_%j.log
+#SBATCH --error=/projects/haitian003ssd/ICRA2027-baseline/pi05/logs/pi05_train_%j.err
 #SBATCH --time=72:00:00
 #SBATCH --gpus=pro6000:1
 #SBATCH --cpus-per-task=8
@@ -11,13 +11,13 @@
 set -euo pipefail
 
 # --- Paths on SSD ---
-BASE_DIR=/projects/hdd/ssd/ICLR2027/baseline
+BASE_DIR=/projects/haitian003ssd/ICRA2027-baseline
 LEROBOT_DIR=${BASE_DIR}/lerobot
 PI05_DIR=${BASE_DIR}/pi05
 TRAIN_SCRIPT=${PI05_DIR}/train_p05.py
-CONDA_ENV=/projects/hdd/ssd/conda/envs/lerobot
-CONDA_PKGS_DIRS=/projects/hdd/ssd/conda/pkgs
-HF_CACHE=/projects/hdd/ssd/hf_cache
+CONDA_ENV=${BASE_DIR}/.conda/lerobot-baselines
+CONDA_PKGS_DIRS=${BASE_DIR}/.cache/conda/pkgs
+HF_CACHE=${BASE_DIR}/.cache/hf
 JOB_HOME=${HF_CACHE}/home
 
 export CONDA_PKGS_DIRS
@@ -57,9 +57,9 @@ if [[ "${INSTALL_EXTRAS:-0}" == "1" ]]; then
 fi
 
 # --- Training config ---
-export DATASET_ROOT=${DATASET_ROOT:-/projects/hdd/ssd/ICLR2027/dataset/factory_conveyor_level2_seeded}
+export DATASET_ROOT=${DATASET_ROOT:-/projects/haitian003ssd/Dataset/factory_conveyor_level2_seeded}
 export DATASET_REPO_ID=${DATASET_REPO_ID:-local/factory_conveyor_level2_seeded}
-export POLICY_PRETRAINED_PATH=${POLICY_PRETRAINED_PATH:-lerobot/pi05_base}
+export POLICY_PRETRAINED_PATH=${POLICY_PRETRAINED_PATH:-${PI05_DIR}/pretrained/pi05_base}
 export OUTPUT_DIR=${OUTPUT_DIR:-${PI05_DIR}/train_outputs/pi05_level_level2_${SLURM_JOB_ID:-local}}
 export JOB_NAME=${JOB_NAME:-pi05_level_level2}
 export LEROBOT_TRAIN_BIN=${LEROBOT_TRAIN_BIN:-${CONDA_ENV}/bin/lerobot-train}

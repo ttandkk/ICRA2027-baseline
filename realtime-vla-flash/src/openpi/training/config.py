@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -478,7 +479,7 @@ class LeRobotUR5DataConfig(DataConfigFactory):
 class FactoryConveyorDataConfig(DataConfigFactory):
     """MotionForge Franka conveyor trajectories stored in a local v2.1-style export."""
 
-    dataset_root: str = "/projects/hdd/ssd/ICLR2027/dataset/factory_conveyor_level2_seeded_old"
+    dataset_root: str = os.environ.get("FACTORY_CONVEYOR_DATASET_ROOT", "/projects/haitian003ssd/Dataset/factory_conveyor_level2_seeded")
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -1065,8 +1066,9 @@ _CONFIGS = [
             pi05=True, action_dim=32, action_horizon=10, discrete_state_input=False,
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",
         ),
-        data=FactoryConveyorDataConfig(repo_id="local/factory_conveyor_level2_seeded_old"),
+        data=FactoryConveyorDataConfig(repo_id="local/factory_conveyor_level2_seeded"),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/projects/haitian003ssd/ICRA2027-baseline/realtime-vla-flash/checkpoints/pi05_base_pytorch",
         batch_size=64,
         num_workers=4,
         num_train_steps=30_000,

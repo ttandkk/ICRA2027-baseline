@@ -187,6 +187,17 @@ def run(config: Config):
         logging.getLogger().setLevel(logging.WARNING)
     set_seed(config.data.seed)
 
+    # Every rank loads the same local checkpoint after the common seed is set.
+    # On RTX PRO 6000 Blackwell nodes, DeepSpeed's redundant parameter
+    # broadcast can trigger a CUDA/NCCL illegal-memory-access during startup.
+    if os.environ.get("GROOT_SKIP_DEEPSPEED_MODEL_BROADCAST") == "1":
+        from deepspeed.runtime.engine import DeepSpeedEngine
+
+        def _skip_model_broadcast(self):
+            logging.warning("Skipping redundant DeepSpeed model broadcast (GROOT_SKIP_DEEPSPEED_MODEL_BROADCAST=1)")
+
+        DeepSpeedEngine._broadcast_model = _skip_model_broadcast
+
     # Validate config
     config.validate()
 
@@ -240,11 +251,27 @@ def run(config: Config):
     # a torn write silently degrades inference, so gate + broadcast failures.
     run_on_rank0(processor.save_pretrained, processor_dir, label="processor.save_pretrained")
 
-    # deepspeed config
-    if config.training.num_gpus > 1 and not config.training.use_ddp:
+    # Distributed strategy: DeepSpeed (default), DDP, or FSDP.
+    if config.training.use_ddp and config.training.use_fsdp:
+        raise ValueError("use_ddp and use_fsdp cannot both be enabled")
+
+    if config.training.num_gpus > 1 and not (config.training.use_ddp or config.training.use_fsdp):
         deepspeed_config = config.get_deepspeed_config()
     else:
         deepspeed_config = None
+
+    fsdp_options = "full_shard auto_wrap" if config.training.use_fsdp else ""
+    fsdp_config = (
+        {
+            "min_num_params": config.training.fsdp_min_num_params,
+            "use_orig_params": True,
+            "sync_module_states": False,
+            "forward_prefetch": False,
+            "limit_all_gathers": True,
+        }
+        if config.training.use_fsdp
+        else None
+    )
 
     # for now we will let per_gpu_batch_size override global_batch_size, in future we will deprecate per_gpu_batch_size
     if config.training.per_gpu_batch_size is None:
@@ -277,6 +304,8 @@ def run(config: Config):
         report_to="wandb" if config.training.use_wandb else "none",
         seed=config.data.seed,
         deepspeed=deepspeed_config,
+        fsdp=fsdp_options,
+        fsdp_config=fsdp_config,
         ddp_find_unused_parameters=False,
         ddp_bucket_cap_mb=config.training.ddp_bucket_cap_mb,
         eval_strategy=config.training.eval_strategy,

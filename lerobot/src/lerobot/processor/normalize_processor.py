@@ -131,6 +131,12 @@ class _NormalizationMixin:
 
         # Convert stats to tensors and move to the target device once during initialization.
         self.stats = self.stats or {}
+        # Dataset metadata may also include bookkeeping entries (for example
+        # ``__fingerprints__``) whose values are strings. Only feature stats
+        # are meaningful to this processor; filtering here prevents those
+        # metadata entries from being recursively converted to tensors.
+        if self.features:
+            self.stats = {key: value for key, value in self.stats.items() if key in self.features}
         if self.dtype is None:
             self.dtype = torch.float32
         self._tensor_stats = to_tensor(self.stats, device=self.device, dtype=self.dtype)

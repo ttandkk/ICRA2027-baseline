@@ -101,6 +101,55 @@ def _time_ms(fn, *, device: torch.device | str) -> tuple[Any, float]:
     return out, (t1 - t0) * 1000.0
 
 
+class LoRALinear(nn.Module):
+    """Frozen linear layer with a trainable low-rank residual."""
+
+    def __init__(self, base_layer: nn.Linear, *, rank: int, alpha: float):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be positive, got {rank}")
+        self.base_layer = base_layer
+        self.rank = rank
+        self.scaling = alpha / rank
+        for parameter in self.base_layer.parameters():
+            parameter.requires_grad_(False)
+        self.lora_a = nn.Parameter(
+            torch.empty(rank, base_layer.in_features, device=base_layer.weight.device, dtype=base_layer.weight.dtype)
+        )
+        self.lora_b = nn.Parameter(
+            torch.zeros(base_layer.out_features, rank, device=base_layer.weight.device, dtype=base_layer.weight.dtype)
+        )
+        nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
+
+
+    @property
+    def weight(self) -> Tensor:
+        return self.base_layer.weight
+
+
+    @property
+    def bias(self) -> Tensor | None:
+        return self.base_layer.bias
+
+    def forward(self, x: Tensor) -> Tensor:
+        base = self.base_layer(x)
+        update = F.linear(F.linear(x, self.lora_a), self.lora_b)
+        return base + update.to(dtype=base.dtype) * self.scaling
+
+
+def _inject_lora(module: nn.Module, *, rank: int, alpha: float) -> int:
+    """Replace Gemma attention and MLP projections with LoRA wrappers."""
+    target_names = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    replaced = 0
+    for child_name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and child_name in target_names:
+            setattr(module, child_name, LoRALinear(child, rank=rank, alpha=alpha))
+            replaced += 1
+        else:
+            replaced += _inject_lora(child, rank=rank, alpha=alpha)
+    return replaced
+
+
 class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -116,6 +165,8 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
+
+        self._configure_lora_finetuning(config)
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -160,6 +211,25 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+    def _configure_lora_finetuning(self, config) -> None:
+        """Enable LoRA adapters and freeze pretrained visual/language backbones."""
+        use_pali_lora = "lora" in config.paligemma_variant
+        use_expert_lora = "lora" in config.action_expert_variant
+        if not (use_pali_lora or use_expert_lora):
+            return
+
+        for parameter in self.paligemma_with_expert.parameters():
+            parameter.requires_grad_(False)
+
+        replaced = 0
+        if use_pali_lora:
+            replaced += _inject_lora(self.paligemma_with_expert.paligemma.language_model, rank=16, alpha=16.0)
+        if use_expert_lora:
+            replaced += _inject_lora(self.paligemma_with_expert.gemma_expert.model, rank=32, alpha=32.0)
+        if replaced == 0:
+            raise RuntimeError("LoRA was requested but no Gemma projection layers were found.")
+        logging.info("Enabled LoRA fine-tuning with %d adapted projection layers", replaced)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""

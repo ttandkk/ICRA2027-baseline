@@ -99,7 +99,24 @@ class DraftChunkHead(nn.Module):
         return (torch.cumsum(pad_mask.to(dtype=torch.int64), dim=1) - 1).clamp_min(0)
 
     def init_from_vlm_layer(self, layer: nn.Module) -> None:
-        self._gemma_block.load_state_dict(layer.state_dict(), strict=True)
+        """Initialize from a Gemma layer, folding any LoRA wrappers into its weights."""
+        source_state = layer.state_dict()
+        merged_state = {}
+        for key, tensor in source_state.items():
+            if key.endswith(".lora_a") or key.endswith(".lora_b"):
+                continue
+            target_key = key.replace(".base_layer.", ".")
+            if key.endswith(".base_layer.weight"):
+                prefix = key[: -len(".base_layer.weight")]
+                lora_a = source_state.get(f"{prefix}.lora_a")
+                lora_b = source_state.get(f"{prefix}.lora_b")
+                if lora_a is not None and lora_b is not None:
+                    lora_module = layer.get_submodule(prefix)
+                    scale = float(getattr(lora_module, "scaling", 1.0))
+                    delta = torch.mm(lora_b.float(), lora_a.float()).to(dtype=tensor.dtype)
+                    tensor = tensor + delta * scale
+            merged_state[target_key] = tensor
+        self._gemma_block.load_state_dict(merged_state, strict=True)
 
     def forward(
         self,

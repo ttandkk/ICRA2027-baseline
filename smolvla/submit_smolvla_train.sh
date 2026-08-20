@@ -78,7 +78,7 @@ fi
 # Factory conveyor level-2 seeded dataset (already in LeRobot v3.0 format).
 export DATASET_ROOT=${DATASET_ROOT:-/projects/hdd/ssd/ICLR2027/dataset/factory_conveyor_level2_seeded}
 export DATASET_REPO_ID=${DATASET_REPO_ID:-local/factory_conveyor_level2_seeded}
-export POLICY_PATH=${POLICY_PATH:-lerobot/smolvla_base}
+export POLICY_PATH=${POLICY_PATH:-${SMOLVLA_DIR}/pretrained/smolvla_base}
 export OUTPUT_DIR=${OUTPUT_DIR:-${SMOLVLA_DIR}/train_outputs/smolvla_factory_conveyor_level2_seeded_${SLURM_JOB_ID:-local}}
 export JOB_NAME=${JOB_NAME:-smolvla_factory_conveyor_level2_seeded}
 export LEROBOT_TRAIN_BIN=${LEROBOT_TRAIN_BIN:-${CONDA_ENV}/bin/lerobot-train}

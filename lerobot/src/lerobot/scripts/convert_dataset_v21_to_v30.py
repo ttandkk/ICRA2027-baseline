@@ -150,19 +150,10 @@ def legacy_load_episodes(local_dir: Path) -> dict:
     return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 
-def normalize_legacy_episode_stats(stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    stats = cast_stats_to_numpy(stats)
-    for feature_stats in stats.values():
-        count = feature_stats.get("count")
-        if count is not None and getattr(count, "ndim", None) == 0:
-            feature_stats["count"] = count.reshape(1)
-    return stats
-
-
 def legacy_load_episodes_stats(local_dir: Path) -> dict:
     episodes_stats = load_jsonlines(local_dir / LEGACY_EPISODES_STATS_PATH)
     return {
-        item["episode_index"]: normalize_legacy_episode_stats(item["stats"])
+        item["episode_index"]: cast_stats_to_numpy(item["stats"])
         for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
     }
 

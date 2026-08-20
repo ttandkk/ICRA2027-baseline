@@ -129,6 +129,15 @@ class FinetuneConfig:
     deepspeed_stage: int = 2
     """DeepSpeed ZeRO stage. Only used for multi-GPU non-DDP training."""
 
+    use_ddp: bool = False
+    """Use native PyTorch DDP instead of DeepSpeed for multi-GPU training."""
+
+    use_fsdp: bool = False
+    """Use PyTorch FSDP full parameter sharding instead of DeepSpeed/DDP."""
+
+    fsdp_min_num_params: int = 100_000_000
+    """Minimum module size for FSDP auto-wrapping."""
+
     gradient_checkpointing: bool = False
     """If True, enable gradient checkpointing in HuggingFace TrainingArguments."""
 

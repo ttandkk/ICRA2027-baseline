@@ -113,6 +113,9 @@ if __name__ == "__main__":
     config.training.warmup_ratio = ft_config.warmup_ratio
     config.training.wandb_project = ft_config.wandb_project
     config.training.deepspeed_stage = ft_config.deepspeed_stage
+    config.training.use_ddp = ft_config.use_ddp
+    config.training.use_fsdp = ft_config.use_fsdp
+    config.training.fsdp_min_num_params = ft_config.fsdp_min_num_params
     config.training.gradient_checkpointing = ft_config.gradient_checkpointing
     config.training.tf32 = ft_config.tf32
     config.training.fp16 = ft_config.fp16

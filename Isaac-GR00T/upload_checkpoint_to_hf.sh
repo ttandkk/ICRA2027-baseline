@@ -2,22 +2,22 @@
 
 set -euo pipefail
 
-# Upload a checkpoint directory to the Hugging Face Hub.
+# Upload the configured GR00T output directory to the Hugging Face Hub.
 # Usage:
-#   bash upload_checkpoint_to_hf.sh <repo_id> [source_dir] [path_in_repo]
+#   bash upload_checkpoint_to_hf.sh [repo_id] [source_dir] [path_in_repo]
 #
-# Examples:
-#   bash upload_checkpoint_to_hf.sh yourname/gr00t-checkpoint-80000
-#   bash upload_checkpoint_to_hf.sh yourname/gr00t-checkpoint-80000 \
-#     /projects/hdd/ssd/ICLR2027/baseline/Isaac-GR00T/outputs/level_level2_finetune_full_87682/level_level2_finetune_full_87682/checkpoint-80000 \
-#     checkpoint-80000
+# Default upload:
+#   bash upload_checkpoint_to_hf.sh
+#
+# The default publishes the FCS002 output directory to:
+#   MotionforgeGroup/gr00t1.7-FCS002-Ablation-80000
 
-BASE_DIR="${BASE_DIR:-/projects/hdd/ssd/ICLR2027/baseline}"
+BASE_DIR="${BASE_DIR:-/projects/haitian003ssd/ICRA2027-baseline}"
 GROOT_DIR="${GROOT_DIR:-${BASE_DIR}/Isaac-GR00T}"
 
-REPO_ID="${1:-${REPO_ID:-}}"
-SOURCE_DIR="${2:-${SOURCE_DIR:-${GROOT_DIR}/outputs/level_level2_finetune_full_87682/level_level2_finetune_full_87682/checkpoint-80000}}"
-PATH_IN_REPO="${3:-${PATH_IN_REPO:-checkpoint-80000}}"
+REPO_ID="${1:-${REPO_ID:-MotionforgeGroup/gr00t1.7-FCS002-Ablation-80000}}"
+SOURCE_DIR="${2:-${SOURCE_DIR:-${GROOT_DIR}/outputs/fcs002_two_static_objects_finetune_full_workers2_20260812_033901}}"
+PATH_IN_REPO="${3:-${PATH_IN_REPO:-.}}"
 
 REPO_TYPE="${REPO_TYPE:-model}"
 PRIVATE_REPO="${PRIVATE_REPO:-1}"
@@ -36,7 +36,7 @@ fi
 
 export HF_HOME="${HF_HOME:-/projects/hdd/ssd/.hf-cache}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
-export TMPDIR="${TMPDIR:-/projects/hdd/ssd/.hf-cache/tmp}"
+export TMPDIR="${TMPDIR:-${HF_HOME}/tmp}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 mkdir -p "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${TMPDIR}"

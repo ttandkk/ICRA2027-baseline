@@ -1,4 +1,9 @@
 # Local environments and generated Python files
+.cache/
+.tmp/
+.conda/
+**/.tools/
+**/.wandb_api_key
 .conda/
 **/.venv/
 **/__pycache__/

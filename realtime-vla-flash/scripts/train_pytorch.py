@@ -443,9 +443,27 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        uses_lora = "lora" in model_cfg.paligemma_variant or "lora" in model_cfg.action_expert_variant
+        if uses_lora:
+            base_state = safetensors.torch.load_file(model_path, device="cpu")
+            remapped_state = {}
+            for model_key in model_to_load.state_dict():
+                source_key = model_key.replace(".base_layer.", ".")
+                if source_key not in base_state and source_key.endswith(".model.language_model.embed_tokens.weight"):
+                    source_key = source_key.replace(".model.language_model.embed_tokens.weight", ".lm_head.weight")
+                if source_key in base_state:
+                    remapped_state[model_key] = base_state[source_key]
+            incompatible = model_to_load.load_state_dict(remapped_state, strict=False)
+            unexpected_missing = [key for key in incompatible.missing_keys if ".lora_a" not in key and ".lora_b" not in key]
+            if unexpected_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    f"Incompatible LoRA base checkpoint; missing={unexpected_missing}, "
+                    f"unexpected={incompatible.unexpected_keys}"
+                )
+            del base_state, remapped_state
+        else:
+            safetensors.torch.load_model(model_to_load, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -454,9 +472,17 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # Create optimizer with LoRA/policy-head parameters only when the model is configured for LoRA.
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise RuntimeError("No trainable parameters found.")
+    logging.info(
+        "Trainable parameters: %d / %d",
+        sum(parameter.numel() for parameter in trainable_parameters),
+        sum(parameter.numel() for parameter in model.parameters()),
+    )
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -543,7 +569,7 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()

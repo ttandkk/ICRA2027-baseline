@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=diffusion_policy_train
-#SBATCH --output=/projects/hdd/ssd/ICLR2027/baseline/DP/logs/diffusion_policy_train_%j.log
-#SBATCH --error=/projects/hdd/ssd/ICLR2027/baseline/DP/logs/diffusion_policy_train_%j.err
+#SBATCH --output=/projects/haitian003ssd/ICRA2027-baseline/DP/logs/diffusion_policy_train_%j.log
+#SBATCH --error=/projects/haitian003ssd/ICRA2027-baseline/DP/logs/diffusion_policy_train_%j.err
 #SBATCH --time=48:00:00
 #SBATCH --gpus=l40:1
 #SBATCH --cpus-per-task=8
@@ -10,11 +10,11 @@
 # unchanged to lerobot-train by train_diffusion_policy.py.
 set -euo pipefail
 
-BASE_DIR=/projects/hdd/ssd/ICLR2027/baseline
+BASE_DIR=/projects/haitian003ssd/ICRA2027-baseline
 LEROBOT_DIR=${BASE_DIR}/lerobot
 DP_DIR=${BASE_DIR}/DP
-CONDA_ENV=/projects/hdd/ssd/conda/envs/lerobot
-HF_CACHE=/projects/hdd/ssd/hf_cache
+CONDA_ENV=${BASE_DIR}/.conda/lerobot-baselines
+HF_CACHE=${BASE_DIR}/.cache/hf
 
 export HF_HOME=${HF_CACHE}
 export HF_LEROBOT_HOME=${HF_CACHE}/lerobot
@@ -33,7 +33,7 @@ eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV}"
 cd "${LEROBOT_DIR}"
 
-export DATASET_ROOT=${DATASET_ROOT:-/projects/hdd/ssd/ICLR2027/dataset/factory_conveyor_level2_seeded}
+export DATASET_ROOT=${DATASET_ROOT:-/projects/haitian003ssd/Dataset/factory_conveyor_level2_seeded}
 export DATASET_REPO_ID=${DATASET_REPO_ID:-local/factory_conveyor_level2_seeded}
 export OUTPUT_DIR=${OUTPUT_DIR:-${DP_DIR}/train_outputs/diffusion_factory_conveyor_level2_seeded_${SLURM_JOB_ID}}
 export JOB_NAME=${JOB_NAME:-diffusion_factory_conveyor_level2_seeded}
