@@ -885,6 +885,35 @@ def parse_observation_gr00t(
     return new_obs
 
 
+def _letterbox_video(value, target_shape):
+    """Resize a THWC image sequence to a shared shape without distorting it."""
+    from PIL import Image
+
+    array = np.asarray(value)
+    squeeze_time = array.ndim == 3
+    if squeeze_time:
+        array = array[None, ...]
+    if array.ndim != 4:
+        raise ValueError(f"Expected image sequence with shape THWC, got {array.shape}")
+
+    target_h, target_w = (int(size) for size in target_shape)
+    if tuple(array.shape[1:3]) == (target_h, target_w):
+        return np.ascontiguousarray(array[0] if squeeze_time else array)
+
+    height, width = array.shape[1:3]
+    scale = min(target_h / height, target_w / width)
+    resized_h = max(1, int(round(height * scale)))
+    resized_w = max(1, int(round(width * scale)))
+    top = max(0, (target_h - resized_h) // 2)
+    left = max(0, (target_w - resized_w) // 2)
+    output = np.zeros((array.shape[0], target_h, target_w, array.shape[3]), dtype=array.dtype)
+    resampling = getattr(getattr(Image, "Resampling", Image), "BILINEAR")
+    for index, frame in enumerate(array):
+        resized = np.asarray(Image.fromarray(frame).resize((resized_w, resized_h), resampling))
+        output[index, top : top + resized_h, left : left + resized_w] = resized
+    return np.ascontiguousarray(output[0] if squeeze_time else output)
+
+
 def prepare_observation(policy, dataset, traj_idx=0):
     """Prepare a single observation for inference."""
     logger.info(f"\nPreparing observation from trajectory {traj_idx}...")
@@ -900,7 +929,8 @@ def prepare_observation(policy, dataset, traj_idx=0):
     for key, value in data_point.states.items():
         observation[f"state.{key}"] = value
     for key, value in data_point.images.items():
-        observation[f"video.{key}"] = np.array(value)
+        image = np.asarray(value)
+        observation[f"video.{key}"] = np.ascontiguousarray(image)
     for key in modality_configs["language"].modality_keys:
         observation[key] = data_point.text
 

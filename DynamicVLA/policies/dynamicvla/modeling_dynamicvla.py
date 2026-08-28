@@ -107,6 +107,7 @@ def load_dynamicvla(
     *,
     device: str = "cpu",
     checkpoint_keys_mapping: str = "",
+    load_normalizers: bool = False,
 ) -> torch.nn.Module:
     state_dict = safetensors.torch.load_file(filename, device=device)
 
@@ -116,12 +117,14 @@ def load_dynamicvla(
 
     state_dict, _ = standardise_state_dict(state_dict, set(model.state_dict().keys()))
 
-    # HACK(aliberts): to not overwrite normalization parameters as they should come from the dataset
     norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
-    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
+    if not load_normalizers:
+        # Training callers provide normalization parameters from the active dataset.
+        state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if not all(key.startswith(norm_keys) for key in missing) or unexpected:
+    allowed_missing_prefixes = norm_keys if not load_normalizers else ()
+    if not all(key.startswith(allowed_missing_prefixes) for key in missing) or unexpected:
         raise RuntimeError(
             "DynamicVLA %d missing / %d unexpected keys"
             % (len(missing), len(unexpected))
@@ -436,6 +439,7 @@ class DynamicVLAPolicy(PreTrainedPolicy):
             model_file,
             device=map_location,
             checkpoint_keys_mapping="model._orig_mod.//model.",
+            load_normalizers=True,
         )
 
     def get_optim_params(self) -> dict:

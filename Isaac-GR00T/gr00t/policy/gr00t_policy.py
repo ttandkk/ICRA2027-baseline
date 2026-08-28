@@ -20,12 +20,13 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
@@ -95,9 +96,21 @@ class Gr00tPolicy(BasePolicy):
         if isinstance(embodiment_tag, str):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
+        backbone_model_path = os.environ.get("GR00T_BACKBONE_MODEL_PATH", "").strip()
+        model_config = None
+        if backbone_model_path:
+            backbone_dir = Path(backbone_model_path).expanduser().resolve()
+            if not backbone_dir.is_dir():
+                raise FileNotFoundError(
+                    "GR00T_BACKBONE_MODEL_PATH does not point to a directory: "
+                    f"{backbone_dir}"
+                )
+            model_config = AutoConfig.from_pretrained(model_dir)
+            model_config.model_name = str(backbone_dir)
 
         # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        model_kwargs = {} if model_config is None else {"config": model_config}
+        model = AutoModel.from_pretrained(model_dir, **model_kwargs)
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
@@ -112,7 +125,13 @@ class Gr00tPolicy(BasePolicy):
             and not (model_dir / "processor_config.json").exists()
             else model_dir
         )
-        self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
+        processor_kwargs = {}
+        if backbone_model_path:
+            processor_kwargs["model_name"] = str(backbone_dir)
+        self.processor: BaseProcessor = AutoProcessor.from_pretrained(
+            processor_dir,
+            **processor_kwargs,
+        )
         self.processor.eval()
 
         # Store embodiment-specific configurations
