@@ -1,10 +1,26 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=xvla_fc001_fc009_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/xvla_fc001_fc009_eval_%j.out
+#SBATCH --error=logs/xvla_fc001_fc009_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${XVLA_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${XVLA_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
+BRIDGE_PYTHONPATH="${MOTIONFORGE_ROOT}/source/motionforge:${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 BRIDGE_CLIENT="${SCRIPT_DIR}/motionforge_xvla_bridge_client.py"
 TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
@@ -24,6 +40,7 @@ MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 XVLA_EVAL_CUDA_VISIBLE_DEVICES="${XVLA_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
 XVLA_HF_HOME="${XVLA_HF_HOME:-${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}}"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
@@ -193,7 +210,11 @@ validate_configuration() {
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${XVLA_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -238,8 +259,8 @@ validate_configuration() {
     || die "XVLA_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
   [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
     || die "XVLA_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
-  [[ -n "${XVLA_EVAL_CUDA_VISIBLE_DEVICES}" ]] \
-    || die "XVLA_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${XVLA_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
+    || die "XVLA_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "XVLA_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -275,13 +296,16 @@ build_commands() {
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
-    "${TRIALS_SERVER}"
+  )
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    SERVER_COMMAND+=("${MOTIONFORGE_PYTHON}" "${TRIALS_SERVER}")
+  else
+    SERVER_COMMAND+=(
+      "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
+      python "${TRIALS_SERVER}"
+    )
+  fi
+  SERVER_COMMAND+=(
     --benchmark_config
     "${benchmark_config}"
     --seed
@@ -356,7 +380,7 @@ print_command() {
 
 print_bridge_command() {
   printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q HF_HOME=%q PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=%q ' \
-    "${LEROBOT_ROOT}" "${XVLA_EVAL_CUDA_VISIBLE_DEVICES}" "${XVLA_HF_HOME}" "${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    "${LEROBOT_ROOT}" "${XVLA_EVAL_CUDA_VISIBLE_DEVICES}" "${XVLA_HF_HOME}" "${BRIDGE_PYTHONPATH}"
   printf '%q ' "${BRIDGE_COMMAND[@]}"
   printf ')\n'
 }
@@ -550,7 +574,7 @@ run_task() {
     export PYTHONDONTWRITEBYTECODE=1
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
-    export PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    export PYTHONPATH="${BRIDGE_PYTHONPATH}"
     exec "${BRIDGE_COMMAND[@]}"
   ) >"${client_log}" 2>&1 &
   BRIDGE_PID="$!"

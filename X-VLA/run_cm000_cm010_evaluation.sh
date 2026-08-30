@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=xvla_cm000_cm010_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/xvla_cm000_cm010_eval_%j.out
+#SBATCH --error=logs/xvla_cm000_cm010_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${XVLA_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${XVLA_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
@@ -25,6 +40,7 @@ MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 XVLA_EVAL_CUDA_VISIBLE_DEVICES="${XVLA_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-3}}"
 XVLA_HF_HOME="${XVLA_HF_HOME:-${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}}"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
@@ -276,7 +292,11 @@ validate_configuration() {
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${XVLA_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -381,8 +401,16 @@ build_commands() {
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}" --signal=TERM --kill-after=30s "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
-    python "${TRIALS_SERVER}"
+  )
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    SERVER_COMMAND+=("${MOTIONFORGE_PYTHON}" "${TRIALS_SERVER}")
+  else
+    SERVER_COMMAND+=(
+      "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
+      python "${TRIALS_SERVER}"
+    )
+  fi
+  SERVER_COMMAND+=(
     --benchmark_config "${benchmark_config}"
     --seed "${START_SEED}"
     --num_trials "${NUM_TRIALS}"

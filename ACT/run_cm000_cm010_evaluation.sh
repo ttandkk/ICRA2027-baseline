@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=act_cm000_cm010_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/act_cm000_cm010_eval_%j.out
+#SBATCH --error=logs/act_cm000_cm010_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${ACT_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${ACT_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
@@ -20,6 +35,7 @@ ACT_ACTION_ALIGNMENT="${ACT_ACTION_ALIGNMENT:-observation_aligned}"
 ACT_PRINT_EVERY="${ACT_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 # CM compound containers and articulated payloads require CPU PhysX. Rendering
 # and ACT inference still use the GPU selected by ACT_EVAL_CUDA_VISIBLE_DEVICES.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
@@ -237,7 +253,11 @@ validate_configuration() {
   require_file "${TRIALS_SERVER}"
   require_dir "${BENCHMARK_DIR}"
   require_executable "${ACT_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -306,8 +326,8 @@ validate_configuration() {
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
     || die "ACT_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
-  [[ "${ACT_EVAL_CUDA_VISIBLE_DEVICES}" == "3" || "${ACT_EVAL_CUDA_VISIBLE_DEVICES}" == "6" ]] \
-    || die "ACT_EVAL_CUDA_VISIBLE_DEVICES must be 3 or 6 for the CM v2 protocol"
+  [[ "${ACT_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
+    || die "ACT_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "ACT_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -338,18 +358,27 @@ build_commands() {
   local task_max_steps="$2"
   local video_dir="$3"
   local video_name="$4"
+  local server_python_command=()
+
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    server_python_command=("${MOTIONFORGE_PYTHON}")
+  else
+    server_python_command=(
+      "${CONDA_EXE}"
+      run
+      --no-capture-output
+      -n
+      "${MOTIONFORGE_CONDA_ENV}"
+      python
+    )
+  fi
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}"
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
+    "${server_python_command[@]}"
     "${TRIALS_SERVER}"
     --benchmark_config
     "${benchmark_config}"

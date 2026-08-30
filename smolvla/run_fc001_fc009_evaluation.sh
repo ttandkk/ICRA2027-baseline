@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=smolvla_fc001_fc009_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/smolvla_fc001_fc009_eval_%j.out
+#SBATCH --error=logs/smolvla_fc001_fc009_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${SMOLVLA_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SMOLVLA_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
@@ -23,6 +38,9 @@ MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
 # Keep physics on CPU while AppLauncher renders on the selected visible GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES="${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
+SMOLVLA_HF_HOME="${SMOLVLA_HF_HOME:-${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}}"
+SMOLVLA_VLM_CACHE_DIR="${SMOLVLA_HF_HOME}/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
@@ -164,10 +182,16 @@ validate_configuration() {
 
   require_dir "${MOTIONFORGE_ROOT}"
   require_dir "${LEROBOT_ROOT}/src/lerobot"
+  require_dir "${SMOLVLA_HF_HOME}"
+  require_dir "${SMOLVLA_VLM_CACHE_DIR}"
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${SMOLVLA_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -212,8 +236,8 @@ validate_configuration() {
     || die "SMOLVLA_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
   [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
     || die "SMOLVLA_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
-  [[ -n "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" ]] \
-    || die "SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
+    || die "SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "SMOLVLA_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -249,13 +273,16 @@ build_commands() {
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
-    "${TRIALS_SERVER}"
+  )
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    SERVER_COMMAND+=("${MOTIONFORGE_PYTHON}" "${TRIALS_SERVER}")
+  else
+    SERVER_COMMAND+=(
+      "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
+      python "${TRIALS_SERVER}"
+    )
+  fi
+  SERVER_COMMAND+=(
     --benchmark_config
     "${benchmark_config}"
     --seed
@@ -331,8 +358,8 @@ print_command() {
 }
 
 print_bridge_command() {
-  printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%q ' \
-    "${LEROBOT_ROOT}" "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" "${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+  printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q HF_HOME=%q PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=%q ' \
+    "${LEROBOT_ROOT}" "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" "${SMOLVLA_HF_HOME}" "${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
   printf '%q ' "${BRIDGE_COMMAND[@]}"
   printf ')\n'
 }
@@ -490,7 +517,10 @@ run_task() {
   (
     cd -- "${LEROBOT_ROOT}"
     export CUDA_VISIBLE_DEVICES="${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}"
+    export HF_HOME="${SMOLVLA_HF_HOME}"
     export PYTHONDONTWRITEBYTECODE=1
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
     export PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
     exec "${BRIDGE_COMMAND[@]}"
   ) >"${client_log}" 2>&1 &
@@ -584,6 +614,7 @@ mkdir -p "${RESULT_DIR}"
   printf 'device=%s\n' "${SMOLVLA_DEVICE}"
   printf 'motionforge_device=%s\n' "${MOTIONFORGE_DEVICE}"
   printf 'cuda_visible_devices=%s\n' "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}"
+  printf 'hf_home=%s\n' "${SMOLVLA_HF_HOME}"
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
   if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then

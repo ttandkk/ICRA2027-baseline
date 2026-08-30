@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=act_fc001_fc009_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/act_fc001_fc009_eval_%j.out
+#SBATCH --error=logs/act_fc001_fc009_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${ACT_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${ACT_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
@@ -20,6 +35,7 @@ ACT_EXECUTION_HORIZON="${ACT_EXECUTION_HORIZON:-8}"
 ACT_PRINT_EVERY="${ACT_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 # Keep physics on CPU while AppLauncher renders on the selected visible GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 ACT_EVAL_CUDA_VISIBLE_DEVICES="${ACT_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
@@ -158,7 +174,11 @@ validate_configuration() {
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${ACT_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -232,18 +252,27 @@ build_commands() {
   local benchmark_config="$1"
   local video_dir="$2"
   local video_name="$3"
+  local server_python_command=()
+
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    server_python_command=("${MOTIONFORGE_PYTHON}")
+  else
+    server_python_command=(
+      "${CONDA_EXE}"
+      run
+      --no-capture-output
+      -n
+      "${MOTIONFORGE_CONDA_ENV}"
+      python
+    )
+  fi
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}"
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
+    "${server_python_command[@]}"
     "${TRIALS_SERVER}"
     --benchmark_config
     "${benchmark_config}"

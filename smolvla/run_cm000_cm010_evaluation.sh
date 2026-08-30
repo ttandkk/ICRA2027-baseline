@@ -1,7 +1,22 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=smolvla_cm000_cm010_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/smolvla_cm000_cm010_eval_%j.out
+#SBATCH --error=logs/smolvla_cm000_cm010_eval_%j.err
+
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${SMOLVLA_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SMOLVLA_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
@@ -28,12 +43,13 @@ MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES="${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
 SMOLVLA_HF_HOME="${SMOLVLA_HF_HOME:-${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}}"
 SMOLVLA_VLM_CACHE_DIR="${SMOLVLA_HF_HOME}/hub/models--HuggingFaceTB--SmolVLM2-500M-Video-Instruct"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
 START_SEED="${SMOLVLA_EVAL_START_SEED:-0}"
 NUM_TRIALS="${SMOLVLA_EVAL_NUM_TRIALS:-10}"
-CLOCK_MODE="${SMOLVLA_EVAL_CLOCK_MODE:-wall_clock_strict}"
+CLOCK_MODE="${SMOLVLA_EVAL_CLOCK_MODE:-slowdown_scaled}"
 OBS_PORT="${SMOLVLA_EVAL_OBS_PORT:-3396}"
 ACT_PORT="${SMOLVLA_EVAL_ACT_PORT:-3398}"
 CLIENT_WARMUP_S="${SMOLVLA_EVAL_CLIENT_WARMUP_S:-5}"
@@ -310,7 +326,11 @@ validate_configuration() {
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${SMOLVLA_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
@@ -321,8 +341,8 @@ validate_configuration() {
 
   [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die \
     "MOTIONFORGE_DEVICE must be cpu for CM evaluation; GPU PhysX makes rotating compound/articulated payloads sink"
-  [[ "${CLOCK_MODE}" == "wall_clock_strict" ]] || die \
-    "SMOLVLA_EVAL_CLOCK_MODE must be wall_clock_strict for realtime CM evaluation; got ${CLOCK_MODE}"
+  [[ "${CLOCK_MODE}" == "slowdown_scaled" ]] || die \
+    "SMOLVLA_EVAL_CLOCK_MODE must be slowdown_scaled for CM v2 evaluation; got ${CLOCK_MODE}"
   [[ "${SMOLVLA_ACTION_ALIGNMENT}" == "observation_aligned" ]] || die \
     "SMOLVLA_ACTION_ALIGNMENT must be observation_aligned for realtime CM evaluation; got ${SMOLVLA_ACTION_ALIGNMENT}"
 
@@ -361,8 +381,8 @@ validate_configuration() {
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
     || die "SMOLVLA_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
-  [[ -n "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" ]] \
-    || die "SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
+    || die "SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "SMOLVLA_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -396,8 +416,16 @@ build_commands() {
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}" --signal=TERM --kill-after=30s "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
-    python "${TRIALS_SERVER}"
+  )
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    SERVER_COMMAND+=("${MOTIONFORGE_PYTHON}" "${TRIALS_SERVER}")
+  else
+    SERVER_COMMAND+=(
+      "${CONDA_EXE}" run --no-capture-output -n "${MOTIONFORGE_CONDA_ENV}"
+      python "${TRIALS_SERVER}"
+    )
+  fi
+  SERVER_COMMAND+=(
     --benchmark_config "${benchmark_config}"
     --seed "${START_SEED}"
     --num_trials "${NUM_TRIALS}"
