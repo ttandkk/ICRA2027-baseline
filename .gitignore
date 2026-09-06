@@ -22,6 +22,17 @@ logs/
 **/results/
 **/eval_logs/
 
+# Local evaluation outputs, deployment artifacts, and scheduler logs
+**/output/
+/Isaac-GR00T/gr00t_trt_deployments/
+/slurm-*.out
+/slurm-*.err
+/DP/*_smoke_*.out
+/DP/*_smoke_*.err
+
+# Local runner backup
+/smolvla/run_hri000_hri009_evaluation.sh.orig
+
 # Downloaded data and models
 **/data/
 **/demo_data/
