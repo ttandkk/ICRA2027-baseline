@@ -96,7 +96,8 @@ class LeRobotEpisodeLoader:
         dataset_path: Path to dataset root directory containing meta/ and data files
         modality_configs: Dictionary mapping modality names to ModalityConfig objects
                          that specify temporal sampling and data keys to load
-        decoder_kwargs: Additional arguments for the video decoder
+        video_backend: Video decoding backend ('torchcodec', 'decord', etc.)
+        video_backend_kwargs: Additional arguments for the video backend
 
     Example:
         >>> loader = LeRobotEpisodeLoader(
@@ -116,7 +117,8 @@ class LeRobotEpisodeLoader:
         self,
         dataset_path: str | Path,
         modality_configs: dict[str, ModalityConfig],
-        decoder_kwargs: dict[str, Any] | None = None,
+        video_backend: str = "torchcodec",
+        video_backend_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize LeRobot episode loader with dataset path and modality configurations.
@@ -127,7 +129,8 @@ class LeRobotEpisodeLoader:
         3. Computing effective episode lengths based on action horizon
         """
         self.dataset_path = Path(dataset_path)
-        self.decoder_kwargs = decoder_kwargs
+        self.video_backend = video_backend
+        self.video_backend_kwargs = video_backend_kwargs
 
         if not self.dataset_path.is_dir():
             raise FileNotFoundError(f"Dataset path does not exist: {self.dataset_path}")
@@ -361,9 +364,7 @@ class LeRobotEpisodeLoader:
         # Load raw parquet data using chunking pattern
         chunk_idx = episode_index // self.chunk_size
         parquet_filename = self.data_path_pattern.format(
-            episode_chunk=chunk_idx,
-            chunk_index=chunk_idx,
-            episode_index=episode_index,
+            episode_chunk=chunk_idx, chunk_index=chunk_idx, episode_index=episode_index
         )
         parquet_path = self.dataset_path / parquet_filename
         original_df = pd.read_parquet(parquet_path)
@@ -445,7 +446,8 @@ class LeRobotEpisodeLoader:
             video_data[image_key] = get_frames_by_indices(
                 str(video_path),
                 indices,
-                decoder_kwargs=self.decoder_kwargs or {},
+                video_backend=self.video_backend,
+                video_backend_kwargs=self.video_backend_kwargs or {},
             )
 
         return video_data
@@ -528,10 +530,11 @@ class LeRobotEpisodeLoader:
                     self.modality_meta[modality][joint_key]["start"],
                     self.modality_meta[modality][joint_key]["end"],
                 )
-                for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99
-                    dataset_statistics[modality][joint_key][stat_type] = self.stats[stats_key][
-                        stat_type
-                    ][start_idx:end_idx]
+                for stat_type in self.stats[stats_key].keys():  # mean, std, min, max, q01, q99, count
+                    stat_value = self.stats[stats_key][stat_type]
+                    if isinstance(stat_value, list):
+                        stat_value = stat_value[start_idx:end_idx]
+                    dataset_statistics[modality][joint_key][stat_type] = stat_value
         stats = _to_plain_dict(dataset_statistics)
         # Directly add relative action stats
         if "relative_action" in self.stats:

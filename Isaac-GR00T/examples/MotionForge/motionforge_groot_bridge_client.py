@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import random
 import sys
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,57 +14,25 @@ from typing import Any
 
 import numpy as np
 
+_motionforge_root = Path(
+    os.environ.get(
+        "MOTIONFORGE_ROOT",
+        Path(__file__).resolve().parents[4] / "MotionForge",
+    )
+)
+_motionforge_source = str(_motionforge_root / "source" / "motionforge")
+if _motionforge_source not in sys.path:
+    sys.path.insert(0, _motionforge_source)
 
-PROTOCOL_VERSION = "motionforge.benchmark.v1"
+from motionforge.benchmark.client import BenchmarkClientBridge, ClientBridgeConfig
+from motionforge.benchmark.protocol import ObservationRequest, ResetMessage
+
 MOTIONFORGE_RGB_KEYS = {
     "overview": "observation.images.overview",
     "front": "observation.images.front",
     "wrist": "observation.images.wrist",
 }
 MOTIONFORGE_STATE_KEY = "observation.state"
-
-
-@dataclass(slots=True)
-class MotionForgeTransport:
-    """Minimal MotionForge benchmark client transport without importing MotionForge."""
-
-    host: str
-    obs_port: int
-    act_port: int
-
-    _zmq: Any = field(init=False)
-    _context: Any = field(init=False)
-    _obs_socket: Any = field(init=False)
-    _act_socket: Any = field(init=False)
-
-    def __post_init__(self) -> None:
-        import zmq
-
-        self._zmq = zmq
-        self._context = zmq.Context()
-        self._obs_socket = self._context.socket(zmq.SUB)
-        self._obs_socket.connect(f"tcp://{self.host}:{self.obs_port}")
-        self._obs_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self._obs_socket.RCVHWM = 1
-        self._act_socket = self._context.socket(zmq.PUSH)
-        self._act_socket.connect(f"tcp://{self.host}:{self.act_port}")
-
-    def recv_latest(self) -> dict[str, Any] | None:
-        message = None
-        while True:
-            try:
-                message = self._obs_socket.recv_pyobj(flags=self._zmq.NOBLOCK)
-            except self._zmq.Again:
-                break
-        return message
-
-    def send_action(self, packet: dict[str, Any]) -> None:
-        self._act_socket.send_pyobj(packet, flags=self._zmq.NOBLOCK)
-
-    def close(self) -> None:
-        self._obs_socket.close(linger=0)
-        self._act_socket.close(linger=0)
-        self._context.term()
 
 
 @dataclass(slots=True)
@@ -90,52 +59,6 @@ class ObservationHistory:
         while len(values) < horizon:
             values.insert(0, values[0])
         return values
-
-
-@dataclass(slots=True)
-class BridgeTiming:
-    """Accumulated wall-clock timing for bridge-side processing."""
-
-    received_observations: int = 0
-    observations: int = 0
-    skipped_observations: int = 0
-    actions: int = 0
-    build_observation_s: float = 0.0
-    policy_get_action_s: float = 0.0
-    send_action_s: float = 0.0
-
-    def to_dict(self) -> dict[str, float | int]:
-        observation_count = max(1, int(self.observations))
-        action_count = max(1, int(self.actions))
-        return {
-            "received_observations": int(self.received_observations),
-            "observations": int(self.observations),
-            "skipped_observations": int(self.skipped_observations),
-            "actions": int(self.actions),
-            "build_observation_s": self.build_observation_s,
-            "policy_get_action_s": self.policy_get_action_s,
-            "send_action_s": self.send_action_s,
-            "build_observation_ms_per_obs": self.build_observation_s * 1000.0 / observation_count,
-            "policy_get_action_ms_per_action": self.policy_get_action_s * 1000.0 / action_count,
-            "send_action_ms_per_action": self.send_action_s * 1000.0 / action_count,
-        }
-
-    def add_received_observation(self) -> None:
-        self.received_observations += 1
-
-    def add_build_observation(self, elapsed_s: float) -> None:
-        self.observations += 1
-        self.build_observation_s += float(elapsed_s)
-
-    def add_skipped_observation(self) -> None:
-        self.skipped_observations += 1
-
-    def add_policy_get_action(self, elapsed_s: float) -> None:
-        self.policy_get_action_s += float(elapsed_s)
-
-    def add_send_action(self, elapsed_s: float) -> None:
-        self.actions += 1
-        self.send_action_s += float(elapsed_s)
 
 
 def parse_args() -> argparse.Namespace:
@@ -190,54 +113,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language-key", default=None, help="GR00T language key receiving MotionForge language_instruction.")
     parser.add_argument("--groot-action-key", default=None, help="GR00T action key to forward; defaults to the only/first key.")
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Convert observations and print shapes without calling GR00T or sending actions.",
-    )
-    parser.add_argument(
         "--num-episodes",
         type=int,
         default=1,
-        help="Stop after this many episode_result messages; use 0 to keep listening until interrupted.",
+        help="Stop after this many acknowledged episode results.",
     )
-    parser.add_argument("--max-steps", type=int, default=None, help="Stop after this many MotionForge observations.")
-    parser.add_argument(
-        "--execution-horizon",
-        type=int,
-        default=8,
-        help=(
-            "Number of env observation steps to execute before requesting a fresh GR00T "
-            "action chunk. Must be <= len(action.delta_indices). Use 1 for the old "
-            "per-observation replan behavior."
-        ),
-    )
-    parser.add_argument(
-        "--action-hz",
-        type=float,
-        default=120.0,
-        help="Temporal frequency represented by consecutive policy actions.",
-    )
-    parser.add_argument(
-        "--action-alignment",
-        choices=("observation_aligned", "execution_aligned"),
-        default="observation_aligned",
-        help="Whether action[0] is aligned to observation capture or execution time.",
-    )
-    parser.add_argument(
-        "--max-inference-hz",
-        type=float,
-        default=30.0,
-        help="Maximum request rate advertised to MotionForge.",
-    )
-    parser.add_argument("--poll-sleep", type=float, default=0.001)
     parser.add_argument("--print-every", type=int, default=10)
     args = parser.parse_args()
-    if int(args.execution_horizon) < 1:
-        raise ValueError("--execution-horizon must be >= 1.")
-    if float(args.action_hz) <= 0.0:
-        raise ValueError("--action-hz must be > 0.")
-    if float(args.max_inference_hz) <= 0.0:
-        raise ValueError("--max-inference-hz must be > 0.")
+    if not 1 <= int(args.motionforge_obs_port) <= 65535:
+        parser.error("--motionforge-obs-port must be in [1, 65535]")
+    if not 1 <= int(args.motionforge_act_port) <= 65535:
+        parser.error("--motionforge-act-port must be in [1, 65535]")
+    if int(args.motionforge_obs_port) == int(args.motionforge_act_port):
+        parser.error("observation and action ports must differ")
+    if int(args.num_episodes) < 1:
+        parser.error("--num-episodes must be >= 1")
+    if int(args.print_every) < 0:
+        parser.error("--print-every must be >= 0")
     return args
 
 
@@ -306,13 +198,12 @@ def apply_groot_acceleration(policy: Any, args: argparse.Namespace) -> None:
     if str(deployment_dir) not in sys.path:
         sys.path.insert(0, str(deployment_dir))
 
-    from gr00t.deployment.modes import InferenceMode
     from trt_model_forward import setup_tensorrt_engines
 
     trt_modes = {
-        "trt_full_pipeline": InferenceMode.n17_full_pipeline,
-        "trt_action_head": InferenceMode.action_head,
-        "trt_dit_only": InferenceMode.dit_only,
+        "trt_full_pipeline": "n17_full_pipeline",
+        "trt_action_head": "action_head",
+        "trt_dit_only": "dit_only",
     }
     setup_tensorrt_engines(policy, args.groot_trt_engine_path, mode=trt_modes[args.groot_accel_mode])
     print(
@@ -336,193 +227,118 @@ def close_groot_acceleration(policy: Any, args: argparse.Namespace) -> None:
         print(f"[MOTIONFORGE-GR00T] failed to close TensorRT engines: {exc}", flush=True)
 
 
-def main() -> int:
-    args = parse_args()
-    if args.poll_sleep < 0.0:
-        raise ValueError("--poll-sleep must be >= 0.")
-    if args.print_every < 0:
-        raise ValueError("--print-every must be >= 0.")
-    if args.num_episodes < 0:
-        raise ValueError("--num-episodes must be >= 0.")
+@dataclass(slots=True)
+class GR00TInference:
+    """GR00T model adapter with RESET-scoped history and RNG state."""
 
-    motionforge = MotionForgeTransport(
-        host=args.motionforge_host,
-        obs_port=args.motionforge_obs_port,
-        act_port=args.motionforge_act_port,
-    )
-    policy = None
-    modality_config = None
-    history = ObservationHistory(maxlen=32)
-    steps_seen = 0
-    actions_sent = 0
-    episodes_seen = 0
-    episode_steps_seen = 0
-    episode_actions_sent = 0
-    episode_timing = BridgeTiming()
-    total_timing = BridgeTiming()
-    action_horizon = None
-    last_policy_observation_index: int | None = None
-    processed_request_ids: set[int] = set()
-    try:
-        if not args.dry_run:
-            policy, modality_config = load_groot_policy(args)
-            action_horizon = _horizon(modality_config, "action")
-            if int(args.execution_horizon) > action_horizon:
-                raise ValueError(
-                    f"--execution-horizon={args.execution_horizon} exceeds policy action horizon "
-                    f"{action_horizon}. Use a value in [1, {action_horizon}]."
-                )
-            print(
-                "[MOTIONFORGE-GR00T] "
-                f"scheduling action_horizon={action_horizon} "
-                f"execution_horizon={args.execution_horizon}",
-                flush=True,
+    args: argparse.Namespace
+    policy: Any = field(init=False)
+    modality_config: dict[str, Any] = field(init=False)
+    history: ObservationHistory = field(init=False)
+    video_map: dict[str, str] = field(init=False)
+    predictions: int = field(init=False, default=0)
+    _closed: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        self.policy, self.modality_config = load_groot_policy(self.args)
+        self.history = ObservationHistory(
+            maxlen=max(
+                _horizon(self.modality_config, "video"),
+                _horizon(self.modality_config, "state"),
             )
-        else:
-            print("[MOTIONFORGE-GR00T] dry-run enabled; GR00T policy will not be called", flush=True)
-
-        print(
-            "[MOTIONFORGE-GR00T] "
-            f"listening motionforge={args.motionforge_host} obs_port={args.motionforge_obs_port} "
-            f"act_port={args.motionforge_act_port}",
-            flush=True,
         )
-        while True:
-            message = motionforge.recv_latest()
-            if message is None:
-                time.sleep(args.poll_sleep)
-                continue
-            if "episode_result" in message:
-                episodes_seen += 1
-                print(
-                    "[MOTIONFORGE-GR00T] "
-                    f"episode_result episode={episodes_seen} observations={episode_steps_seen} "
-                    f"actions_sent={episode_actions_sent} result={message['episode_result']}",
-                    flush=True,
-                )
-                print_bridge_timing("episode_timing", episode_timing, episode=episodes_seen)
-                history.clear()
-                episode_steps_seen = 0
-                episode_actions_sent = 0
-                episode_timing = BridgeTiming()
-                last_policy_observation_index = None
-                processed_request_ids.clear()
-                if args.num_episodes and episodes_seen >= args.num_episodes:
-                    break
-                reset_policy = getattr(policy, "reset", None)
-                if callable(reset_policy):
-                    reset_policy()
-                continue
+        self.video_map = parse_video_map(self.args.video_map)
 
-            request_id = optional_request_id(message)
-            if request_id == 0 and message.get("request_kind") == "warmup":
-                history.clear()
-                processed_request_ids.clear()
-                last_policy_observation_index = None
-                reset_policy = getattr(policy, "reset", None)
-                if callable(reset_policy):
-                    reset_policy()
-            history.append(message)
-            steps_seen += 1
-            episode_steps_seen += 1
-            episode_timing.add_received_observation()
-            total_timing.add_received_observation()
-            observation_index = observation_step_index(message, fallback=steps_seen - 1)
-            request_driven = request_id is not None
-            if request_driven and request_id in processed_request_ids:
-                episode_timing.add_skipped_observation()
-                total_timing.add_skipped_observation()
-                continue
-            if request_driven:
-                should_request_action = True
-            else:
-                should_request_action = args.dry_run or should_replan(
-                    observation_index=observation_index,
-                    last_policy_observation_index=last_policy_observation_index,
-                    execution_horizon=int(args.execution_horizon),
-                )
-            if not should_request_action:
-                episode_timing.add_skipped_observation()
-                total_timing.add_skipped_observation()
-                if args.print_every and (steps_seen == 1 or steps_seen % args.print_every == 0):
-                    next_index = int(last_policy_observation_index or 0) + int(args.execution_horizon)
-                    print(
-                        "[MOTIONFORGE-GR00T] "
-                        f"skip_replan obs={steps_seen} index={observation_index} "
-                        f"next_replan_index={next_index}",
-                        flush=True,
-                    )
-                if args.max_steps is not None and steps_seen >= args.max_steps:
-                    break
-                continue
+    @property
+    def action_horizon(self) -> int:
+        return _horizon(self.modality_config, "action")
 
-            started_at = time.perf_counter()
-            observation = build_groot_observation(
-                message=message,
-                history=history,
-                modality_config=modality_config,
-                observation_format=args.groot_observation_format,
-                video_map=parse_video_map(args.video_map),
-                state_key=args.state_key,
-                language_key=args.language_key,
-            )
-            elapsed_s = time.perf_counter() - started_at
-            episode_timing.add_build_observation(elapsed_s)
-            total_timing.add_build_observation(elapsed_s)
-            if args.print_every and (steps_seen == 1 or steps_seen % args.print_every == 0):
-                print_shape_summary(steps_seen, observation)
-            if args.dry_run:
-                if args.max_steps is not None and steps_seen >= args.max_steps:
-                    break
-                continue
+    def reset(self, reset: ResetMessage) -> None:
+        """Clear temporal state and seed model RNGs from the server RESET."""
+        seed = int(reset.seed)
+        if not 0 <= seed < 2**63 - 1:
+            raise ValueError(f"RESET seed must be in [0, 2**63 - 2], got {seed}.")
+        self.history.clear()
+        seed_policy_rng(seed)
+        reset_policy = getattr(self.policy, "reset", None)
+        if callable(reset_policy):
+            reset_policy()
 
-            assert policy is not None
-            started_at = time.perf_counter()
-            action, info = policy.get_action(observation)
-            elapsed_s = time.perf_counter() - started_at
-            episode_timing.add_policy_get_action(elapsed_s)
-            total_timing.add_policy_get_action(elapsed_s)
-            packet = motionforge_action_packet(
-                action=action,
-                observation_index=observation_index,
-                action_key=args.groot_action_key,
-                request_id=request_id,
-                action_hz=float(args.action_hz),
-                action_alignment=str(args.action_alignment),
-                inference_duration_s=elapsed_s,
-                max_inference_hz=float(args.max_inference_hz),
-                metadata={
-                    "client": "motionforge_groot_bridge",
-                    "groot_info": safe_metadata(info),
-                    "action_horizon": action_horizon,
-                    "execution_horizon": int(args.execution_horizon),
-                    "request_kind": message.get("request_kind"),
-                },
-            )
-            started_at = time.perf_counter()
-            motionforge.send_action(packet)
-            elapsed_s = time.perf_counter() - started_at
-            episode_timing.add_send_action(elapsed_s)
-            total_timing.add_send_action(elapsed_s)
-            actions_sent += 1
-            episode_actions_sent += 1
-            last_policy_observation_index = observation_index
-            if request_id is not None:
-                processed_request_ids.add(request_id)
-            if args.max_steps is not None and steps_seen >= args.max_steps:
-                break
-    finally:
-        close_groot_acceleration(policy, args)
-        motionforge.close()
-        close_policy = getattr(policy, "close", None)
+    def predict(self, observation: ObservationRequest) -> np.ndarray:
+        message = observation.to_dict()
+        self.history.append(message)
+        policy_observation = build_groot_observation(
+            message=message,
+            history=self.history,
+            modality_config=self.modality_config,
+            observation_format=self.args.groot_observation_format,
+            video_map=self.video_map,
+            state_key=self.args.state_key,
+            language_key=self.args.language_key,
+        )
+        self.predictions += 1
+        if self.args.print_every and (
+            self.predictions == 1 or self.predictions % int(self.args.print_every) == 0
+        ):
+            print_shape_summary(self.predictions, policy_observation)
+        action, _info = self.policy.get_action(policy_observation)
+        return motionforge_action_chunk(action=action, action_key=self.args.groot_action_key)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close_groot_acceleration(self.policy, self.args)
+        close_policy = getattr(self.policy, "close", None)
         if callable(close_policy):
             close_policy()
+
+
+def seed_policy_rng(seed: int) -> None:
+    """Seed the global RNGs used internally by the GR00T policy implementation."""
+    random.seed(seed)
+    np.random.seed(seed % 2**32)
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def main() -> int:
+    args = parse_args()
+    inference = GR00TInference(args)
     print(
         "[MOTIONFORGE-GR00T] "
-        f"done episodes={episodes_seen} observations={steps_seen} actions_sent={actions_sent}",
+        f"scheduling action_horizon={inference.action_horizon} "
+        "wire_horizon=server_required_16",
         flush=True,
     )
-    print_bridge_timing("total_timing", total_timing)
+    print(
+        "[MOTIONFORGE-GR00T] "
+        f"listening motionforge={args.motionforge_host} obs_port={args.motionforge_obs_port} "
+        f"act_port={args.motionforge_act_port}",
+        flush=True,
+    )
+    try:
+        bridge = BenchmarkClientBridge(
+            policy=inference,
+            config=ClientBridgeConfig(
+                host=args.motionforge_host,
+                obs_port=int(args.motionforge_obs_port),
+                act_port=int(args.motionforge_act_port),
+                num_episodes=int(args.num_episodes),
+                print_every=int(args.print_every),
+            ),
+            log=lambda message: print(f"[MOTIONFORGE-GR00T] {message}", flush=True),
+        )
+        bridge.run()
+    except KeyboardInterrupt:
+        print("[MOTIONFORGE-GR00T] interrupted", flush=True)
+        return 130
+    finally:
+        inference.close()
+    print(f"[MOTIONFORGE-GR00T] done episodes={args.num_episodes}", flush=True)
     return 0
 
 
@@ -587,55 +403,26 @@ def build_groot_observation(
     return flat
 
 
-def motionforge_action_packet(
-    *,
-    action: dict[str, Any],
-    observation_index: int,
-    action_key: str | None,
-    metadata: dict[str, Any],
-    request_id: int | None = None,
-    action_hz: float | None = None,
-    action_alignment: str | None = None,
-    inference_duration_s: float | None = None,
-    max_inference_hz: float | None = None,
-) -> dict[str, Any]:
+def motionforge_action_chunk(
+    *, action: dict[str, Any], action_key: str | None
+) -> np.ndarray:
+    """Select and validate the canonical 10D MotionForge source-action chunk."""
     selected_key, array = select_action(action, action_key)
     if array.ndim == 3:
+        if int(array.shape[0]) != 1:
+            raise ValueError(
+                f"GR00T action {selected_key!r} batch must be 1, got {array.shape}."
+            )
         array = array[0]
-    if array.ndim == 1:
-        width = int(array.shape[0])
-    elif array.ndim == 2:
-        width = int(array.shape[1])
-    else:
-        raise ValueError(f"Unsupported GR00T action shape for {selected_key!r}: {array.shape}")
-    if width == 10:
-        motionforge_action_key = "eef_xyz_rot6d_gripper"
-    elif width == 8:
-        motionforge_action_key = "eef_pose_gripper"
-    else:
+    if array.ndim != 2 or int(array.shape[1]) != 10:
         raise ValueError(
-            f"GR00T action {selected_key!r} has width {width}; MotionForge accepts width 10 "
-            "`eef_xyz_rot6d_gripper` or width 8 `eef_pose_gripper`. Add an action adapter for this checkpoint."
+            f"GR00T action {selected_key!r} must have shape [T, 10] for the formal "
+            f"MotionForge action schema, got {array.shape}."
         )
-    packet = {
-        "protocol_version": PROTOCOL_VERSION,
-        "action": np.asarray(array, dtype=np.float32),
-        "action_key": motionforge_action_key,
-        "action_frame": "robot",
-        "action_representation": "ABSOLUTE",
-        "observation_index": int(observation_index),
-        "created_time": time.time(),
-        "metadata": {**metadata, "groot_action_key": selected_key},
-    }
-    optional = {
-        "request_id": request_id,
-        "action_hz": action_hz,
-        "action_alignment": action_alignment,
-        "inference_duration_s": inference_duration_s,
-        "max_inference_hz": max_inference_hz,
-    }
-    packet.update({key: value for key, value in optional.items() if value is not None})
-    return packet
+    array = np.ascontiguousarray(array, dtype=np.float32)
+    if not np.isfinite(array).all():
+        raise ValueError(f"GR00T action {selected_key!r} contains non-finite values.")
+    return array
 
 
 def select_action(action: dict[str, Any], action_key: str | None) -> tuple[str, np.ndarray]:
@@ -716,29 +503,6 @@ def _horizon(modality_config: dict[str, Any] | None, modality: str) -> int:
     if not modality_config or modality not in modality_config:
         return 1
     return max(1, len(modality_config[modality].delta_indices))
-
-
-def observation_step_index(message: dict[str, Any], *, fallback: int) -> int:
-    try:
-        return int(message.get("index", fallback))
-    except (TypeError, ValueError):
-        return int(fallback)
-
-
-def optional_request_id(message: dict[str, Any]) -> int | None:
-    value = message.get("request_id")
-    return None if value is None else int(value)
-
-
-def should_replan(
-    *,
-    observation_index: int,
-    last_policy_observation_index: int | None,
-    execution_horizon: int,
-) -> bool:
-    if last_policy_observation_index is None:
-        return True
-    return int(observation_index) - int(last_policy_observation_index) >= int(execution_horizon)
 
 
 def _state_for_key(key: str, value: np.ndarray, *, state_keys: tuple[str, ...] = ()) -> np.ndarray:
@@ -825,38 +589,6 @@ def print_shape_summary(step: int, observation: dict[str, Any]) -> None:
         if key.startswith(("video.", "state."))
     }
     print(f"[MOTIONFORGE-GR00T] obs={step} shapes={shapes}", flush=True)
-
-
-def print_bridge_timing(label: str, timing: BridgeTiming, *, episode: int | None = None) -> None:
-    values = timing.to_dict()
-    episode_part = "" if episode is None else f" episode={episode}"
-    print(
-        "[MOTIONFORGE-GR00T] "
-        f"{label}{episode_part} "
-        f"received_observations={values['received_observations']} "
-        f"policy_observations={values['observations']} "
-        f"skipped_observations={values['skipped_observations']} "
-        f"actions={values['actions']} "
-        f"build_observation_s={values['build_observation_s']:.3f} "
-        f"policy_get_action_s={values['policy_get_action_s']:.3f} "
-        f"send_action_s={values['send_action_s']:.3f} "
-        f"build_observation_ms_per_obs={values['build_observation_ms_per_obs']:.3f} "
-        f"policy_get_action_ms_per_action={values['policy_get_action_ms_per_action']:.3f} "
-        f"send_action_ms_per_action={values['send_action_ms_per_action']:.3f}",
-        flush=True,
-    )
-
-
-def safe_metadata(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): safe_metadata(item) for key, item in value.items()}
-    if isinstance(value, np.ndarray):
-        return {"shape": tuple(int(dim) for dim in value.shape), "dtype": str(value.dtype)}
-    if isinstance(value, (list, tuple)):
-        return [safe_metadata(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return repr(value)
 
 
 if __name__ == "__main__":

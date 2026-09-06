@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-filter",
         default=None,
-        help="Only test dataset directory names containing this string (for example cm_010).",
+        help="Only test dataset directory names containing this string (for example cm_006).",
     )
     parser.add_argument(
         "--max-datasets",

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-# Keep legacy FC runners compatible without duplicating the common bridge code in
+# Let FC runners import the shared MotionForge client without duplicating it in
 # this baseline directory. CM runners also provide this path through PYTHONPATH.
 _motionforge_root = Path(
     os.environ.get(
@@ -29,7 +30,7 @@ import numpy as np
 import torch
 
 from motionforge.benchmark.client import BenchmarkClientBridge, ClientBridgeConfig
-from motionforge.benchmark.protocol import ObservationPacket, PROTOCOL_VERSION
+from motionforge.benchmark.protocol import ObservationRequest, ResetMessage
 
 STATE_KEY = "observation.state"
 TASK_KEY = "task"
@@ -51,13 +52,22 @@ POLICY_IMAGE_SHAPES = {
 MOTIONFORGE_STATE_SHAPE = (10,)
 
 
+def seed_policy_rng(seed: int) -> None:
+    if not 0 <= int(seed) < 2**63 - 1:
+        raise ValueError(f"RESET seed must be in [0, 2**63 - 2], got {seed}.")
+    random.seed(int(seed))
+    np.random.seed(int(seed) % 2**32)
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
 @dataclass(slots=True)
 class XVLAInference:
     """X-VLA model plus the processors serialized with its checkpoint."""
 
     checkpoint: Path
     device: str
-    action_hz: float = 30.0
 
     config: Any = field(init=False)
     policy: Any = field(init=False)
@@ -97,7 +107,9 @@ class XVLAInference:
     def action_horizon(self) -> int:
         return int(self.config.chunk_size)
 
-    def reset(self) -> None:
+    def reset(self, reset: ResetMessage) -> None:
+        """Clear all episode-local processor and policy state on RESET."""
+        seed_policy_rng(int(reset.seed))
         self.policy.reset()
         self.preprocessor.reset()
         self.postprocessor.reset()
@@ -120,7 +132,7 @@ class XVLAInference:
             raise ValueError("X-VLA produced non-finite actions.")
         return array
 
-    def predict(self, observation: ObservationPacket) -> np.ndarray:
+    def predict(self, observation: ObservationRequest) -> np.ndarray:
         return self.predict_chunk(observation.to_dict())
 
 
@@ -132,20 +144,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motionforge-obs-port", type=int, default=3196)
     parser.add_argument("--motionforge-act-port", type=int, default=3198)
     parser.add_argument("--num-episodes", type=int, default=1)
-    parser.add_argument("--action-hz", type=float, default=30.0)
-    parser.add_argument("--max-inference-hz", type=float, default=30.0)
-    parser.add_argument(
-        "--send-horizon",
-        type=int,
-        default=16,
-        help="Number of leading X-VLA actions sent to MotionForge; GR00T FC sends 16.",
-    )
-    parser.add_argument(
-        "--execution-horizon",
-        type=int,
-        default=8,
-        help="Execution horizon advertised in packet metadata; GR00T FC uses 8.",
-    )
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument(
         "--validate-checkpoint",
@@ -161,12 +159,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("observation and action ports must differ")
     if args.num_episodes < 1:
         parser.error("--num-episodes must be >= 1")
-    if args.action_hz <= 0 or args.max_inference_hz <= 0:
-        parser.error("action and inference frequencies must be positive")
-    if args.send_horizon < 1:
-        parser.error("--send-horizon must be >= 1")
-    if not 1 <= args.execution_horizon <= args.send_horizon:
-        parser.error("--execution-horizon must be in [1, --send-horizon]")
     if args.print_every < 0:
         parser.error("--print-every must be >= 0")
     return args
@@ -272,7 +264,6 @@ def validate_xvla_contract(checkpoint: Path, config: Any) -> None:
 
 
 def build_xvla_observation(message: dict[str, Any]) -> dict[str, torch.Tensor | str]:
-    require_protocol(message)
     observation: dict[str, torch.Tensor | str] = {TASK_KEY: require_task(message)}
 
     state = np.asarray(require_field(message, STATE_KEY), dtype=np.float32).reshape(-1)
@@ -315,14 +306,6 @@ def require_field(message: dict[str, Any], key: str) -> Any:
     return message[key]
 
 
-def require_protocol(message: dict[str, Any]) -> None:
-    protocol = message.get("protocol_version")
-    if protocol != PROTOCOL_VERSION:
-        raise ValueError(
-            f"Unsupported MotionForge protocol {protocol!r}; expected {PROTOCOL_VERSION!r}."
-        )
-
-
 def installed_lerobot_version() -> str:
     try:
         return version("lerobot")
@@ -332,10 +315,6 @@ def installed_lerobot_version() -> str:
 
 def synthetic_message() -> dict[str, Any]:
     message: dict[str, Any] = {
-        "protocol_version": PROTOCOL_VERSION,
-        "index": 0,
-        "request_id": 0,
-        "request_kind": "validation",
         TASK_KEY: "Pick up the moving cardboard package from the conveyor and place it into the box.",
         STATE_KEY: np.zeros(MOTIONFORGE_STATE_SHAPE, dtype=np.float32),
     }
@@ -363,18 +342,12 @@ def main() -> int:
     inference = XVLAInference(
         checkpoint=args.model_path,
         device=args.device,
-        action_hz=float(args.action_hz),
     )
-    if args.send_horizon > inference.action_horizon:
-        raise ValueError(
-            f"--send-horizon={args.send_horizon} exceeds checkpoint action horizon "
-            f"{inference.action_horizon}."
-        )
     print(
         "[MOTIONFORGE-XVLA] loaded "
         f"checkpoint={inference.checkpoint} device={args.device} "
         f"lerobot={current_version} action_horizon={inference.action_horizon} "
-        f"send_horizon={args.send_horizon} execution_horizon={args.execution_horizon}",
+        "wire_horizon=server_required_16",
         flush=True,
     )
     if args.validate_checkpoint:
@@ -394,9 +367,6 @@ def main() -> int:
             act_port=int(args.motionforge_act_port),
             num_episodes=int(args.num_episodes),
             print_every=int(args.print_every),
-            legacy_send_horizon=int(args.send_horizon),
-            legacy_execution_horizon=int(args.execution_horizon),
-            legacy_max_inference_hz=float(args.max_inference_hz),
         ),
         log=lambda message: print(f"[MOTIONFORGE-XVLA] {message}", flush=True),
     )

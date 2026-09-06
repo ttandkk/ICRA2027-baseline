@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ -n "${FASTWAM_SCRIPT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${FASTWAM_SCRIPT_DIR}" && pwd -P)"
+elif [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
+BRIDGE_PYTHONPATH="${MOTIONFORGE_ROOT}/source/motionforge:${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 BRIDGE_CLIENT="${SCRIPT_DIR}/motionforge_fastwam_bridge_client.py"
 TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
@@ -13,14 +20,11 @@ BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/factory_conveyor"
 FASTWAM_MODEL_PATH="${FASTWAM_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/Fast-WAM/FC-40000}"
 FASTWAM_PYTHON="${FASTWAM_PYTHON:-${WORKSPACE_ROOT}/miniconda3/envs/lerobot/bin/python}"
 FASTWAM_DEVICE="${FASTWAM_DEVICE:-cuda:0}"
-FASTWAM_ACTION_HZ="${FASTWAM_ACTION_HZ:-30}"
-FASTWAM_MAX_INFERENCE_HZ="${FASTWAM_MAX_INFERENCE_HZ:-30}"
-FASTWAM_SEND_HORIZON="${FASTWAM_SEND_HORIZON:-16}"
-FASTWAM_EXECUTION_HORIZON="${FASTWAM_EXECUTION_HORIZON:-8}"
 FASTWAM_PRINT_EVERY="${FASTWAM_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
-# Protocol default: CPU physics, with rendering and policy inference on the visible GPU.
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
+# Formal evaluation uses CPU physics; rendering and policy inference use the visible GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
 FASTWAM_EVAL_CUDA_VISIBLE_DEVICES="${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
 FASTWAM_HF_HOME="${FASTWAM_HF_HOME:-${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}}"
@@ -29,14 +33,9 @@ TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
 START_SEED="${FASTWAM_EVAL_START_SEED:-0}"
 NUM_TRIALS="${FASTWAM_EVAL_NUM_TRIALS:-50}"
-# Keep an explicit override available, but use each benchmark YAML by default.
-MAX_STEPS="${FASTWAM_EVAL_MAX_STEPS:-1400}"
-USE_BENCHMARK_MAX_STEPS="${FASTWAM_EVAL_USE_BENCHMARK_MAX_STEPS:-1}"
-MOTION_LEVEL="${FASTWAM_EVAL_MOTION_LEVEL:-}"
-INITIAL_POSITION_MODE="${FASTWAM_EVAL_INITIAL_POSITION_MODE:-fixed}"
+ATTEMPTS_PER_WORKER="${FASTWAM_EVAL_ATTEMPTS_PER_WORKER:-1}"
 OBS_PORT="${FASTWAM_EVAL_OBS_PORT:-3196}"
 ACT_PORT="${FASTWAM_EVAL_ACT_PORT:-3198}"
-CLIENT_WARMUP_S="${FASTWAM_EVAL_CLIENT_WARMUP_S:-5}"
 TASK_TIMEOUT_S="${FASTWAM_EVAL_TASK_TIMEOUT_S:-14400}"
 BETWEEN_TASKS_S="${FASTWAM_EVAL_BETWEEN_TASKS_S:-5}"
 PERSISTENT_BRIDGE="${FASTWAM_EVAL_PERSISTENT_BRIDGE:-0}"
@@ -45,15 +44,17 @@ BRIDGE_READY_TIMEOUT_S="${FASTWAM_EVAL_BRIDGE_READY_TIMEOUT_S:-900}"
 VIDEO_WIDTH="${FASTWAM_EVAL_VIDEO_WIDTH:-640}"
 VIDEO_HEIGHT="${FASTWAM_EVAL_VIDEO_HEIGHT:-480}"
 VIDEO_STRIDE="${FASTWAM_EVAL_VIDEO_STRIDE:-1}"
+VIDEO_OUTCOME_SUFFIX="${FASTWAM_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/output"
-RUN_ID="${FASTWAM_EVAL_RUN_ID:-fastwam_fc001_fc009_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${FASTWAM_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output/factory_conveyor/fc000_fc009/level2_fixed/server_scheduled}"
+RUN_ID="${FASTWAM_EVAL_RUN_ID:-fastwam_fc000_fc009_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 BRIDGE_LOG="${RESULT_DIR}/bridge.log"
 DRY_RUN="${DRY_RUN:-0}"
 
 DEFAULT_TASK_IDS=(
+  fc_000
   fc_001
   fc_002
   fc_003
@@ -80,15 +81,14 @@ LAST_TRIALS=0
 LAST_SUCCESSES=0
 LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
-LAST_RAW_SUMMARY=""
 PERSISTENT_BRIDGE_FAILED=0
 
 log() {
-  printf '[FASTWAM-FC001-FC009-EVAL] %s\n' "$*"
+  printf '[FASTWAM-FC000-FC009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[FASTWAM-FC001-FC009-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[FASTWAM-FC000-FC009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -116,11 +116,12 @@ require_uint_at_least() {
   fi
 }
 
-require_positive_number() {
-  local name="$1"
-  local value="$2"
-  awk -v value="${value}" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0) }' \
-    || die "${name} must be a positive number, got ${value}"
+benchmark_max_steps() {
+  local benchmark_config="$1"
+  local configured=""
+  configured="$(awk '/^[[:space:]]*max_steps:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "${benchmark_config}")"
+  [[ -n "${configured}" ]] || die "runtime.max_steps not found in benchmark: ${benchmark_config}"
+  printf '%s\n' "${configured}"
 }
 
 validate_checkpoint() {
@@ -146,7 +147,9 @@ config = json.loads((checkpoint / "config.json").read_text())
 train_policy = json.loads((checkpoint / "train_config.json").read_text()).get("policy")
 assert isinstance(train_policy, dict)
 expected_saved = dict(train_policy)
-expected_saved["pretrained_path"] = None
+# Exports may clear the resume source or retain the recorded training source.
+if config.get("pretrained_path") is None:
+    expected_saved["pretrained_path"] = None
 assert config == expected_saved
 assert config.get("type") == "fastwam"
 assert config.get("action_dim") == 10
@@ -217,7 +220,7 @@ with safe_open(checkpoint / "model.safetensors", framework="pt", device="cpu") a
 }
 
 validate_runtime_imports() {
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${BRIDGE_PYTHONPATH}" \
     "${FASTWAM_PYTHON}" -c '
 import zmq
 from lerobot.configs import PreTrainedConfig
@@ -226,66 +229,99 @@ from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
 ' || die "FastWAM runtime imports failed; verify the LeRobot fastwam extra and pyzmq"
 }
 
+validate_bridge_contract() {
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${BRIDGE_PYTHONPATH}" \
+    "${FASTWAM_PYTHON}" -c '
+import inspect
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import motionforge_fastwam_bridge_client as client
+from motionforge.benchmark.client import BenchmarkClientBridge
+from motionforge.benchmark.protocol import PROTOCOL
+
+assert PROTOCOL == "motionforge.server_scheduled"
+assert list(inspect.signature(client.FastWAMInference.reset).parameters) == ["self", "reset"]
+assert list(inspect.signature(client.FastWAMInference.predict).parameters) == ["self", "observation"]
+assert not hasattr(client, "require_dt_scale")
+assert not hasattr(client, "scaled_inference_timing")
+assert not hasattr(client, "MotionForgeTransport")
+assert BenchmarkClientBridge is not None
+' "${SCRIPT_DIR}" || die "Fast-WAM bridge does not match the FC server-scheduled contract"
+}
+
 validate_configuration() {
   local task_id=""
   local benchmark_config=""
+  local task_max_steps=""
+  local task_motion_level=""
+
+  [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die "MOTIONFORGE_DEVICE must be cpu for formal FC evaluation"
+  [[ "${FASTWAM_EVAL_INITIAL_POSITION_MODE:-fixed}" == "fixed" ]] \
+    || die "FASTWAM_EVAL_INITIAL_POSITION_MODE must be fixed for formal FC evaluation"
+  [[ "${FASTWAM_EVAL_USE_BENCHMARK_MAX_STEPS:-1}" == "1" ]] \
+    || die "FASTWAM_EVAL_USE_BENCHMARK_MAX_STEPS must be 1; max_steps comes from benchmark_config"
 
   require_dir "${MOTIONFORGE_ROOT}"
   require_dir "${LEROBOT_ROOT}/src/lerobot"
   require_dir "${FASTWAM_HF_HOME}"
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
+  require_dir "${BENCHMARK_DIR}"
   require_executable "${FASTWAM_PYTHON}"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
   validate_checkpoint
   validate_runtime_imports
+  validate_bridge_contract
 
   ((${#TASK_IDS[@]} > 0)) || die "FASTWAM_EVAL_TASKS must select at least one task"
   for task_id in "${TASK_IDS[@]}"; do
-    [[ "${task_id}" =~ ^fc_00[1-9]$ ]] || die "invalid FC task id: ${task_id}"
+    [[ "${task_id}" =~ ^fc_00[0-9]$ ]] || die "invalid FC task id: ${task_id}"
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
     require_file "${benchmark_config}"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
+    require_uint_at_least "${task_id} max_steps" "${task_max_steps}" 1
+    # Legacy settings may agree with the benchmark, but must never override it.
+    if [[ -n "${FASTWAM_EVAL_MAX_STEPS:-}" ]]; then
+      [[ "${FASTWAM_EVAL_MAX_STEPS}" == "${task_max_steps}" ]] \
+        || die "FASTWAM_EVAL_MAX_STEPS conflicts with ${task_id} benchmark max_steps=${task_max_steps}"
+    fi
+    if [[ -n "${FASTWAM_EVAL_MOTION_LEVEL:-}" ]]; then
+      task_motion_level="$(awk '/^[[:space:]]*motion_level:[[:space:]]*level[123][[:space:]]*$/ { print $2; exit }' "${benchmark_config}")"
+      [[ "${FASTWAM_EVAL_MOTION_LEVEL}" == "${task_motion_level}" ]] \
+        || die "FASTWAM_EVAL_MOTION_LEVEL conflicts with ${task_id} benchmark motion_level=${task_motion_level}"
+    fi
   done
 
   require_uint_at_least "FASTWAM_EVAL_START_SEED" "${START_SEED}" 0
   require_uint_at_least "FASTWAM_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
-  require_uint_at_least "FASTWAM_EVAL_MAX_STEPS" "${MAX_STEPS}" 1
+  require_uint_at_least "FASTWAM_EVAL_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
   require_uint_at_least "FASTWAM_EVAL_OBS_PORT" "${OBS_PORT}" 1
   require_uint_at_least "FASTWAM_EVAL_ACT_PORT" "${ACT_PORT}" 1
-  require_uint_at_least "FASTWAM_EVAL_CLIENT_WARMUP_S" "${CLIENT_WARMUP_S}" 0
   require_uint_at_least "FASTWAM_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
   require_uint_at_least "FASTWAM_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
   require_uint_at_least "FASTWAM_EVAL_BRIDGE_READY_TIMEOUT_S" "${BRIDGE_READY_TIMEOUT_S}" 1
   require_uint_at_least "FASTWAM_PRINT_EVERY" "${FASTWAM_PRINT_EVERY}" 0
-  require_uint_at_least "FASTWAM_SEND_HORIZON" "${FASTWAM_SEND_HORIZON}" 1
-  require_uint_at_least "FASTWAM_EXECUTION_HORIZON" "${FASTWAM_EXECUTION_HORIZON}" 1
   require_uint_at_least "FASTWAM_EVAL_VIDEO_WIDTH" "${VIDEO_WIDTH}" 2
   require_uint_at_least "FASTWAM_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
   require_uint_at_least "FASTWAM_EVAL_VIDEO_STRIDE" "${VIDEO_STRIDE}" 1
-  require_positive_number "FASTWAM_ACTION_HZ" "${FASTWAM_ACTION_HZ}"
-  require_positive_number "FASTWAM_MAX_INFERENCE_HZ" "${FASTWAM_MAX_INFERENCE_HZ}"
-
-  ((10#${FASTWAM_EXECUTION_HORIZON} <= 10#${FASTWAM_SEND_HORIZON})) \
-    || die "FASTWAM_EXECUTION_HORIZON must be <= FASTWAM_SEND_HORIZON"
-  ((10#${FASTWAM_SEND_HORIZON} <= 32)) \
-    || die "FASTWAM_SEND_HORIZON must be <= the checkpoint action horizon 32"
   ((10#${OBS_PORT} <= 65535)) || die "FASTWAM_EVAL_OBS_PORT must be <= 65535"
   ((10#${ACT_PORT} <= 65535)) || die "FASTWAM_EVAL_ACT_PORT must be <= 65535"
   [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
   [[ "${PERSISTENT_BRIDGE}" == "0" || "${PERSISTENT_BRIDGE}" == "1" ]] \
     || die "FASTWAM_EVAL_PERSISTENT_BRIDGE must be 0 or 1"
-  [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" || "${USE_BENCHMARK_MAX_STEPS}" == "1" ]] \
-    || die "FASTWAM_EVAL_USE_BENCHMARK_MAX_STEPS must be 0 or 1"
-  [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
-    || die "FASTWAM_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
-  [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
-    || die "FASTWAM_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
-  [[ -n "${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}" ]] \
-    || die "FASTWAM_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
+    || die "FASTWAM_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
+  [[ "${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
+    || die "FASTWAM_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "FASTWAM_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -313,20 +349,30 @@ trap 'exit 143' TERM
 
 build_server_command() {
   local benchmark_config="$1"
-  local video_dir="$2"
-  local video_name="$3"
+  local task_max_steps="$2"
+  local video_dir="$3"
+  local video_name="$4"
+  local server_python_command=()
+
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    server_python_command=("${MOTIONFORGE_PYTHON}")
+  else
+    server_python_command=(
+      "${CONDA_EXE}"
+      run
+      --no-capture-output
+      -n
+      "${MOTIONFORGE_CONDA_ENV}"
+      python
+    )
+  fi
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}"
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
+    "${server_python_command[@]}"
     "${TRIALS_SERVER}"
     --benchmark_config
     "${benchmark_config}"
@@ -334,16 +380,18 @@ build_server_command() {
     "${START_SEED}"
     --num_trials
     "${NUM_TRIALS}"
+    --attempts_per_worker
+    "${ATTEMPTS_PER_WORKER}"
+    --max_steps
+    "${task_max_steps}"
     --initial_position_mode
-    "${INITIAL_POSITION_MODE}"
+    fixed
     --device
     "${MOTIONFORGE_DEVICE}"
     --obs_port
     "${OBS_PORT}"
     --act_port
     "${ACT_PORT}"
-    --client_warmup
-    "${CLIENT_WARMUP_S}"
     --video_dir
     "${video_dir}"
     --video_name
@@ -355,18 +403,16 @@ build_server_command() {
     --video_stride
     "${VIDEO_STRIDE}"
   )
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" ]]; then
-    SERVER_COMMAND+=(--max_steps "${MAX_STEPS}")
+  if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+    SERVER_COMMAND+=(--video_outcome_suffix)
   fi
-  if [[ -n "${MOTION_LEVEL}" ]]; then
-    SERVER_COMMAND+=(--motion_level "${MOTION_LEVEL}")
-  fi
+
 }
 
 build_bridge_command() {
   local num_episodes="${NUM_TRIALS}"
   if [[ "${PERSISTENT_BRIDGE}" == "1" ]]; then
-    num_episodes=0
+    num_episodes="$((${#TASK_IDS[@]} * NUM_TRIALS))"
   fi
   BRIDGE_COMMAND=()
   if [[ "${PERSISTENT_BRIDGE}" == "0" ]]; then
@@ -390,14 +436,6 @@ build_bridge_command() {
     "${ACT_PORT}"
     --num-episodes
     "${num_episodes}"
-    --action-hz
-    "${FASTWAM_ACTION_HZ}"
-    --max-inference-hz
-    "${FASTWAM_MAX_INFERENCE_HZ}"
-    --send-horizon
-    "${FASTWAM_SEND_HORIZON}"
-    --execution-horizon
-    "${FASTWAM_EXECUTION_HORIZON}"
     --print-every
     "${FASTWAM_PRINT_EVERY}"
   )
@@ -410,7 +448,7 @@ start_bridge() {
     export CUDA_VISIBLE_DEVICES="${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}"
     export HF_HOME="${FASTWAM_HF_HOME}"
     export PYTHONDONTWRITEBYTECODE=1
-    export PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    export PYTHONPATH="${BRIDGE_PYTHONPATH}"
     exec "${BRIDGE_COMMAND[@]}"
   ) >"${bridge_log}" 2>&1 &
   BRIDGE_PID="$!"
@@ -453,7 +491,7 @@ print_command() {
 
 print_bridge_command() {
   printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q HF_HOME=%q PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%q ' \
-    "${LEROBOT_ROOT}" "${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}" "${FASTWAM_HF_HOME}" "${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    "${LEROBOT_ROOT}" "${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}" "${FASTWAM_HF_HOME}" "${BRIDGE_PYTHONPATH}"
   printf '%q ' "${BRIDGE_COMMAND[@]}"
   printf ')\n'
 }
@@ -497,6 +535,7 @@ wait_for_server_and_bridge() {
 }
 
 wait_for_server_with_persistent_bridge() {
+  local allow_bridge_completion="${1:-0}"
   local server_pid="${SERVER_PID}"
   local bridge_pid="${BRIDGE_PID}"
   local completed_pid=""
@@ -512,6 +551,16 @@ wait_for_server_with_persistent_bridge() {
   fi
 
   BRIDGE_PID=""
+  if ((process_status == 0)) && [[ "${allow_bridge_completion}" == "1" ]]; then
+    log "persistent bridge completed its configured episodes; waiting for final task server"
+    set +e
+    wait "${server_pid}"
+    process_status="$?"
+    set -e
+    SERVER_PID=""
+    return "${process_status}"
+  fi
+
   PERSISTENT_BRIDGE_FAILED=1
   ((process_status != 0)) || process_status=1
   log "persistent bridge exited unexpectedly status=${process_status}; stopping task server"
@@ -529,14 +578,12 @@ parse_task_summary() {
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
   summary_line="$(grep -F '[MOTIONFORGE-BENCH] trials_summary ' "${server_log}" | tail -n 1 || true)"
   [[ -n "${summary_line}" && "${summary_line}" =~ ${pattern} ]] || return 1
   LAST_TRIALS="${BASH_REMATCH[1]}"
   LAST_SUCCESSES="${BASH_REMATCH[2]}"
   LAST_FAILURES="${BASH_REMATCH[3]}"
   LAST_SUCCESS_RATE="${BASH_REMATCH[4]}"
-  LAST_RAW_SUMMARY="${summary_line}"
   ((10#${LAST_TRIALS} == 10#${NUM_TRIALS})) || return 1
   ((10#${LAST_SUCCESSES} + 10#${LAST_FAILURES} == 10#${LAST_TRIALS})) || return 1
 }
@@ -550,76 +597,78 @@ count_videos() {
   printf '%s\n' "${#videos[@]}"
 }
 
-trial_video_outcome() {
-  local server_log="$1"
-  local trial_number="$2"
-  local result_line=""
-  local pattern="trial=${trial_number}/${NUM_TRIALS}[[:space:]]+seed=[0-9]+[[:space:]]+success=(True|False)[[:space:]]"
-
-  result_line="$(grep -E "\\[MOTIONFORGE-BENCH\\] trial_result trial=${trial_number}/${NUM_TRIALS} .* success=(True|False) " "${server_log}" | tail -n 1 || true)"
-  [[ -n "${result_line}" && "${result_line}" =~ ${pattern} ]] || return 1
-  if [[ "${BASH_REMATCH[1]}" == "True" ]]; then
-    printf 'success\n'
-  else
-    printf 'failure\n'
-  fi
-}
-
-rename_video_outputs() {
-  local task_id="$1"
-  local video_dir="$2"
-  local server_log="$3"
-  local trial_number=0
-  local source_path=""
-  local destination_path=""
-  local outcome=""
-  for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
-    outcome="$(trial_video_outcome "${server_log}" "${trial_number}")" || return 1
-    if ((10#${NUM_TRIALS} == 1)); then
-      source_path="${video_dir}/${task_id}_rollout.mp4"
-      destination_path="${video_dir}/${task_id}_rollout_${outcome}.mp4"
-    else
-      printf -v source_path '%s/%s_rollout_trial_%03d.mp4' \
-        "${video_dir}" "${task_id}" "${trial_number}"
-      printf -v destination_path '%s/%s_rollout_trial_%03d_%s.mp4' \
-        "${video_dir}" "${task_id}" "${trial_number}" "${outcome}"
-    fi
-    [[ -s "${source_path}" && ! -e "${destination_path}" ]] || return 1
-    mv -- "${source_path}" "${destination_path}" || return 1
-  done
-}
-
 validate_video_outputs() {
   local task_id="$1"
   local video_dir="$2"
   local server_log="$3"
   local trial_number=0
+  local result_count=0
+  local line=""
   local video_path=""
-  local outcome=""
-  for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
-    outcome="$(trial_video_outcome "${server_log}" "${trial_number}")" || return 1
-    if ((10#${NUM_TRIALS} == 1)); then
-      video_path="${video_dir}/${task_id}_rollout_${outcome}.mp4"
+  local opposite_path=""
+  local retry_suffix=""
+  local result_pattern='^\[MOTIONFORGE-BENCH\] trial_result trial=([1-9][0-9]*)/([1-9][0-9]*) seed=[0-9]+ attempt=([1-9][0-9]*) success=(True|False) '
+  local -a attempts=() outcomes=()
+
+  [[ -r "${server_log}" ]] || return 1
+  # Only the scored attempt identifies the final video; earlier attempts may be invalid.
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == '[MOTIONFORGE-BENCH] trial_result '* ]] || continue
+    [[ "${line}" =~ ${result_pattern} ]] || return 1
+    # Bound numeric fields before Bash arithmetic to avoid integer overflow.
+    ((${#BASH_REMATCH[1]} <= 9 && ${#BASH_REMATCH[2]} <= 9 && ${#BASH_REMATCH[3]} <= 9)) || return 1
+    trial_number=$((10#${BASH_REMATCH[1]}))
+    ((trial_number <= 10#${NUM_TRIALS} && 10#${BASH_REMATCH[2]} == 10#${NUM_TRIALS})) || return 1
+    [[ -z "${attempts[trial_number]:-}" ]] || return 1
+    attempts[trial_number]="${BASH_REMATCH[3]}"
+    if [[ "${BASH_REMATCH[4]}" == "True" ]]; then
+      outcomes[trial_number]=success
     else
-      printf -v video_path '%s/%s_rollout_trial_%03d_%s.mp4' \
-        "${video_dir}" "${task_id}" "${trial_number}" "${outcome}"
+      outcomes[trial_number]=failure
     fi
-    [[ -s "${video_path}" ]] || return 1
+    result_count=$((result_count + 1))
+  done <"${server_log}"
+  ((result_count == 10#${NUM_TRIALS})) || return 1
+
+  for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
+    if ((10#${NUM_TRIALS} == 1)); then
+      video_path="${video_dir}/${task_id}_rollout"
+    else
+      printf -v video_path '%s/%s_rollout_trial_%03d' "${video_dir}" "${task_id}" "${trial_number}"
+    fi
+    retry_suffix=""
+    if ((10#${attempts[trial_number]} > 1)); then
+      printf -v retry_suffix '_retry_%03d' "$((10#${attempts[trial_number]} - 1))"
+    fi
+    video_path+="${retry_suffix}"
+    if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+      if [[ "${outcomes[trial_number]}" == "success" ]]; then
+        opposite_path="${video_path}_failure.mp4"
+      else
+        opposite_path="${video_path}_success.mp4"
+      fi
+      [[ ! -e "${opposite_path}" ]] || return 1
+      video_path+="_${outcomes[trial_number]}"
+    fi
+    [[ -s "${video_path}.mp4" ]] || return 1
   done
+  return 0
 }
 
 append_task_result() {
   local task_id="$1"
   local status="$2"
   local benchmark_config="$3"
-  local video_dir="$4"
-  local reason="$5"
+  local task_max_steps="$4"
+  local video_dir="$5"
+  local reason="$6"
   local video_count=""
   video_count="$(count_videos "${video_dir}")"
   {
     printf '\n[%s]\n' "${task_id}"
     printf 'status=%s\n' "${status}"
     printf 'benchmark=%s\n' "${benchmark_config}"
+    printf 'max_steps=%s\n' "${task_max_steps}"
     printf 'trials=%s\n' "${LAST_TRIALS:-N/A}"
     printf 'successes=%s\n' "${LAST_SUCCESSES:-N/A}"
     printf 'failures=%s\n' "${LAST_FAILURES:-N/A}"
@@ -627,7 +676,6 @@ append_task_result() {
     printf 'video_dir=%s\n' "${video_dir}"
     printf 'video_count=%s\n' "${video_count}"
     printf 'reason=%s\n' "${reason}"
-    printf 'raw_summary=%s\n' "${LAST_RAW_SUMMARY:-N/A}"
   } >>"${SUMMARY_FILE}"
 }
 
@@ -639,19 +687,21 @@ run_task() {
   local client_log="${task_result_dir}/client.log"
   local video_dir="${task_result_dir}/videos"
   local process_status=0
-  local max_steps_label="${MAX_STEPS}"
+  local task_max_steps=""
+  local allow_bridge_completion=0
 
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
+  if [[ "${task_id}" == "${TASK_IDS[-1]}" ]]; then
+    allow_bridge_completion=1
   fi
+
+  task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
   LAST_TRIALS=0
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
   mkdir -p "${video_dir}" || return 1
-  build_server_command "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-  log "starting task=${task_id} trials=${NUM_TRIALS} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  build_server_command "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps} motion_level=benchmark_config initial_position_mode=fixed seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
 
   (
     cd -- "${MOTIONFORGE_ROOT}"
@@ -662,7 +712,7 @@ run_task() {
   SERVER_PID="$!"
 
   if [[ "${PERSISTENT_BRIDGE}" == "1" ]]; then
-    if wait_for_server_with_persistent_bridge; then
+    if wait_for_server_with_persistent_bridge "${allow_bridge_completion}"; then
       process_status=0
     else
       process_status="$?"
@@ -677,26 +727,21 @@ run_task() {
     fi
   fi
   if ((process_status != 0)); then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server/client process exit status ${process_status}"
     return "${process_status}"
   fi
   if ! parse_task_summary "${server_log}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server log has no valid ${NUM_TRIALS}-trial summary"
     return 1
   fi
-  if ! rename_video_outputs "${task_id}" "${video_dir}" "${server_log}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
-      "could not match and rename every rollout video with its trial outcome"
-    return 1
-  fi
   if ! validate_video_outputs "${task_id}" "${video_dir}" "${server_log}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
-      "expected ${NUM_TRIALS} non-empty outcome-labeled rollout videos"
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
+      "expected ${NUM_TRIALS} non-empty rollout videos matching video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX}"
     return 1
   fi
-  append_task_result "${task_id}" completed "${benchmark_config}" "${video_dir}" "none"
+  append_task_result "${task_id}" completed "${benchmark_config}" "${task_max_steps}" "${video_dir}" "none"
   log "completed task=${task_id} successes=${LAST_SUCCESSES}/${LAST_TRIALS} success_rate=${LAST_SUCCESS_RATE}"
 }
 
@@ -709,12 +754,15 @@ append_overall_summary() {
   local expected_tasks="${#TASK_IDS[@]}"
   local expected_trials=$((expected_tasks * NUM_TRIALS))
   local total_success_rate="N/A"
+  local partial_success_rate="N/A"
   local overall_status="incomplete"
+
   if ((completed_trials > 0)); then
-    total_success_rate="$(awk -v successes="${total_successes}" -v trials="${completed_trials}" 'BEGIN { printf "%.3f", successes / trials }')"
+    partial_success_rate="$(awk -v successes="${total_successes}" -v trials="${completed_trials}" 'BEGIN { printf "%.3f", successes / trials }')"
   fi
   if ((completed_tasks == expected_tasks && failed_tasks == 0 && completed_trials == expected_trials)); then
     overall_status="completed"
+    total_success_rate="${partial_success_rate}"
   fi
   {
     printf '\n[overall]\n'
@@ -727,6 +775,7 @@ append_overall_summary() {
     printf 'total_successes=%s\n' "${total_successes}"
     printf 'total_failures=%s\n' "${total_failures}"
     printf 'total_success_rate=%s\n' "${total_success_rate}"
+    printf 'partial_success_rate=%s\n' "${partial_success_rate}"
     printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
   } >>"${SUMMARY_FILE}"
 }
@@ -735,12 +784,7 @@ validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "validated configuration; no process or result directory will be created"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  else
-    max_steps_label="${MAX_STEPS}"
-  fi
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} send_horizon=${FASTWAM_SEND_HORIZON} execution_horizon=${FASTWAM_EXECUTION_HORIZON}"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config motion_level=benchmark_config initial_position_mode=fixed timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX}"
   log "model=${FASTWAM_MODEL_PATH} hf_home=${FASTWAM_HF_HOME} persistent_bridge=${PERSISTENT_BRIDGE} result_dir=${RESULT_DIR}"
   if [[ "${PERSISTENT_BRIDGE}" == "1" ]]; then
     build_bridge_command
@@ -749,9 +793,10 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   fi
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
     video_dir="${RESULT_DIR}/${task_id}/videos"
-    build_server_command "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-    log "dry-run task=${task_id} benchmark=${benchmark_config}"
+    build_server_command "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
+    log "dry-run task=${task_id} max_steps=${task_max_steps} benchmark=${benchmark_config}"
     print_command "${MOTIONFORGE_ROOT}" "${SERVER_COMMAND[@]}"
     if [[ "${PERSISTENT_BRIDGE}" == "0" ]]; then
       build_bridge_command
@@ -766,11 +811,11 @@ if [[ -e "${RESULT_DIR}" ]]; then
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'FastWAM FC001-FC009 MotionForge evaluation\n'
+  printf 'FastWAM FC000-FC009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${FASTWAM_MODEL_PATH}"
   printf 'device=%s\n' "${FASTWAM_DEVICE}"
-  printf 'motionforge_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
   printf 'cuda_visible_devices=%s\n' "${FASTWAM_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'hf_home=%s\n' "${FASTWAM_HF_HOME}"
   printf 'persistent_bridge=%s\n' "${PERSISTENT_BRIDGE}"
@@ -781,26 +826,22 @@ mkdir -p "${RESULT_DIR}"
     printf 'bridge_log=per_task_client.log\n'
   fi
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
+  printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    printf 'max_steps_per_trial=benchmark_config\n'
-  else
-    printf 'max_steps_per_trial=%s\n' "${MAX_STEPS}"
-  fi
-  printf 'motion_level=%s\n' "${MOTION_LEVEL:-benchmark_config}"
+  printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
+  printf 'max_steps_source=benchmark_config\n'
+  printf 'motion_level=benchmark_config\n'
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
-  printf 'initial_position_mode=%s\n' "${INITIAL_POSITION_MODE}"
-  printf 'action_hz=%s\n' "${FASTWAM_ACTION_HZ}"
-  printf 'max_inference_hz=%s\n' "${FASTWAM_MAX_INFERENCE_HZ}"
+  printf 'initial_position_mode=fixed\n'
+  printf 'timing_source=benchmark_config\n'
   printf 'action_horizon=32\n'
   printf 'trained_action_steps=10\n'
-  printf 'send_horizon=%s\n' "${FASTWAM_SEND_HORIZON}"
-  printf 'execution_horizon=%s\n' "${FASTWAM_EXECUTION_HORIZON}"
   printf 'video_enabled=true\n'
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"
   printf 'video_stride=%s\n' "${VIDEO_STRIDE}"
+  printf 'video_outcome_suffix=%s\n' "${VIDEO_OUTCOME_SUFFIX}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0

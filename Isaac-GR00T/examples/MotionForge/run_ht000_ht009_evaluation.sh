@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=gr00t_fc000_fc009_eval
+#SBATCH --job-name=gr00t_ht000_ht009_eval
 #SBATCH --partition=cluster02
 #SBATCH --gres=gpu:rtx5090:1
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --output=logs/gr00t_fc000_fc009_eval_%j.out
-#SBATCH --error=logs/gr00t_fc000_fc009_eval_%j.err
+#SBATCH --output=logs/gr00t_ht000_ht009_eval_%j.out
+#SBATCH --error=logs/gr00t_ht000_ht009_eval_%j.err
 
 set -Eeuo pipefail
 
@@ -17,11 +17,11 @@ MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 
 BRIDGE_CLIENT="${GROOT_ROOT}/examples/MotionForge/motionforge_groot_bridge_client.py"
 TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
-BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/factory_conveyor"
+BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/home_tabletop"
 RUNTIME_ASSET_DIR="${MOTIONFORGE_ROOT}/source/motionforge/motionforge/assets/runtime"
 
-GROOT_MODEL_PATH="${GROOT_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/gr00t1.7-FC-80000}"
-GROOT_TRT_ENGINE_PATH="${GROOT_TRT_ENGINE_PATH:-${GROOT_ROOT}/gr00t_trt_deployments/gr00t_trt_deployment_gr00t1.7-FC-80000/engines}"
+GROOT_MODEL_PATH="${GROOT_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/gr00t1.7-HT-80000}"
+GROOT_TRT_ENGINE_PATH="${GROOT_TRT_ENGINE_PATH:-${GROOT_ROOT}/gr00t_trt_deployments/gr00t_trt_deployment_gr00t1.7-HT-80000/engines}"
 GROOT_PYTHON="${GROOT_PYTHON:-${GROOT_ROOT}/.venv/bin/python}"
 GROOT_FFMPEG_PREFIX="${GROOT_FFMPEG_PREFIX:-${WORKSPACE_ROOT}/.cache/gr00t-ffmpeg}"
 GROOT_ACCEL_MODE="${GROOT_ACCEL_MODE:-trt_full_pipeline}"
@@ -30,53 +30,54 @@ GROOT_EMBODIMENT_TAG="${GROOT_EMBODIMENT_TAG:-NEW_EMBODIMENT}"
 GROOT_BACKBONE_MODEL_PATH="${GROOT_BACKBONE_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/nvidia/Cosmos-Reason2-2B}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
-MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
-# Keep physics on CPU while AppLauncher renders on the visible GPU.
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-${WORKSPACE_ROOT}/isaacsim/python.sh}"
+# Home Tabletop evaluation uses CPU PhysX to match the data-generation
+# environment. Rendering and GR00T/TensorRT still use the selected GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
-FC_EVAL_CUDA_VISIBLE_DEVICES="${FC_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
+HT_EVAL_CUDA_VISIBLE_DEVICES="${HT_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
-START_SEED="${FC_EVAL_START_SEED:-0}"
-NUM_TRIALS="${FC_EVAL_NUM_TRIALS:-50}"
+START_SEED="${HT_EVAL_START_SEED:-0}"
+NUM_TRIALS="${HT_EVAL_NUM_TRIALS:-50}"
 ATTEMPTS_PER_WORKER="${GROOT_EVAL_ATTEMPTS_PER_WORKER:-50}"
-# Keep an explicit override available, but use each benchmark YAML by default.
-MAX_STEPS="${FC_EVAL_MAX_STEPS:-1400}"
-USE_BENCHMARK_MAX_STEPS="${FC_EVAL_USE_BENCHMARK_MAX_STEPS:-1}"
-MOTION_LEVEL="${FC_EVAL_MOTION_LEVEL:-}"
-INITIAL_POSITION_MODE="${FC_EVAL_INITIAL_POSITION_MODE:-fixed}"
-OBS_PORT="${FC_EVAL_OBS_PORT:-3196}"
-ACT_PORT="${FC_EVAL_ACT_PORT:-3198}"
-TASK_TIMEOUT_S="${FC_EVAL_TASK_TIMEOUT_S:-14400}"
-BETWEEN_TASKS_S="${FC_EVAL_BETWEEN_TASKS_S:-5}"
+WORKER_START_TIMEOUT_S="${HT_EVAL_WORKER_START_TIMEOUT_S:-1200}"
+ATTEMPT_TIMEOUT_S="${HT_EVAL_ATTEMPT_TIMEOUT_S:-900}"
+OBS_PORT="${HT_EVAL_OBS_PORT:-3396}"
+ACT_PORT="${HT_EVAL_ACT_PORT:-3398}"
+TASK_TIMEOUT_S="${HT_EVAL_TASK_TIMEOUT_S:-14400}"
+BETWEEN_TASKS_S="${HT_EVAL_BETWEEN_TASKS_S:-5}"
 
 GROOT_PRINT_EVERY="${GROOT_PRINT_EVERY:-10}"
 
-VIDEO_WIDTH="${FC_EVAL_VIDEO_WIDTH:-640}"
-VIDEO_HEIGHT="${FC_EVAL_VIDEO_HEIGHT:-480}"
-VIDEO_STRIDE="${FC_EVAL_VIDEO_STRIDE:-1}"
-VIDEO_OUTCOME_SUFFIX="${FC_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
+VIDEO_WIDTH="${HT_EVAL_VIDEO_WIDTH:-640}"
+VIDEO_HEIGHT="${HT_EVAL_VIDEO_HEIGHT:-480}"
+VIDEO_STRIDE="${HT_EVAL_VIDEO_STRIDE:-1}"
+VIDEO_OUTCOME_SUFFIX="${HT_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/outputs"
-RUN_ID="${FC_EVAL_RUN_ID:-fc000_fc009_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${HT_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/home_tabletop/ht000_ht009/level2_fixed/server_scheduled}"
+RUN_ID="${HT_EVAL_RUN_ID:-ht000_ht009_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
 
-TASK_IDS=(
-  fc_000
-  fc_001
-  fc_002
-  fc_003
-  fc_004
-  fc_005
-  fc_006
-  fc_007
-  fc_008
-  fc_009
+DEFAULT_TASK_IDS=(
+  ht_000
+  ht_001
+  ht_002
+  ht_003
+  ht_004
+  ht_005
+  ht_006
+  ht_007
+  ht_008
+  ht_009
 )
-if [[ -n "${FC_EVAL_TASKS:-}" ]]; then
-  read -r -a TASK_IDS <<<"${FC_EVAL_TASKS}"
+
+if [[ -n "${HT_EVAL_TASKS:-}" ]]; then
+  read -r -a TASK_IDS <<<"${HT_EVAL_TASKS}"
+else
+  TASK_IDS=("${DEFAULT_TASK_IDS[@]}")
 fi
 
 SERVER_PID=""
@@ -90,11 +91,11 @@ LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
 
 log() {
-  printf '[FC000-FC009-EVAL] %s\n' "$*"
+  printf '[HT000-HT009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[FC000-FC009-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[HT000-HT009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -154,9 +155,19 @@ resolve_backbone_model_path() {
   GROOT_BACKBONE_MODEL_PATH="$(cd -- "${snapshot_dir}" && pwd -P)"
 }
 
+benchmark_max_steps() {
+  local benchmark_config="$1"
+  local configured=""
+
+  configured="$(awk '/^[[:space:]]*max_steps:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "${benchmark_config}")"
+  [[ -n "${configured}" ]] || die "runtime.max_steps not found in benchmark: ${benchmark_config}"
+  printf '%s\n' "${configured}"
+}
+
 validate_configuration() {
   local task_id=""
   local benchmark_config=""
+  local task_max_steps=""
 
   resolve_backbone_model_path
   require_dir "${MOTIONFORGE_ROOT}"
@@ -168,12 +179,14 @@ validate_configuration() {
   require_file "${GROOT_BACKBONE_MODEL_PATH}/model.safetensors"
   require_file "${GROOT_BACKBONE_MODEL_PATH}/preprocessor_config.json"
   require_file "${GROOT_BACKBONE_MODEL_PATH}/tokenizer_config.json"
-  require_file "${RUNTIME_ASSET_DIR}/conveyors/belt_a06/ConveyorBelt_A06.usd"
-  require_file "${RUNTIME_ASSET_DIR}/environments/simple_warehouse/warehouse.usd"
-  require_file "${RUNTIME_ASSET_DIR}/containers/boxes/box06/box06.usd"
-  require_file "${RUNTIME_ASSET_DIR}/containers/trays/tray05/tray05.usd"
-  require_file "${RUNTIME_ASSET_DIR}/objects/xuanyu/packages/cardboard_boxes_set_16_sizes/derived/cardboard_box_400mm_cube/cardboard_box_400mm_cube.usda"
-  require_file "${RUNTIME_ASSET_DIR}/objects/cans/can15/can15.usd"
+
+  # Canonical fixed-mode Home Tabletop assets.
+  require_file "${RUNTIME_ASSET_DIR}/environments/home_room/home_room.usda"
+  require_file "${RUNTIME_ASSET_DIR}/furniture/mounts/franka_stand/stand.usd"
+  require_file "${RUNTIME_ASSET_DIR}/furniture/tables/home_table_visual_19/home_table_visual_19.usda"
+  require_file "${RUNTIME_ASSET_DIR}/furniture/tabletop_cabinets/low_wood_cabinet/low_wood_cabinet.usda"
+  require_file "${RUNTIME_ASSET_DIR}/containers/boxes/storage_open_plastic_crate_02/storage_open_plastic_crate_02.usda"
+
   require_executable "${GROOT_PYTHON}"
   require_dir "${GROOT_FFMPEG_PREFIX}/lib"
   if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
@@ -184,10 +197,16 @@ validate_configuration() {
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
 
-  ((${#TASK_IDS[@]} > 0)) || die "FC_EVAL_TASKS must select at least one task"
+  [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die \
+    "MOTIONFORGE_DEVICE must be cpu for Home Tabletop evaluation"
+
+  ((${#TASK_IDS[@]} > 0)) || die "HT_EVAL_TASKS must select at least one task"
   for task_id in "${TASK_IDS[@]}"; do
+    [[ "${task_id}" =~ ^ht_00[0-9]$ ]] || die "invalid Home Tabletop task id: ${task_id}"
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
     require_file "${benchmark_config}"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
+    require_uint_at_least "${task_id} max_steps" "${task_max_steps}" 1
   done
 
   case "${GROOT_ACCEL_MODE}" in
@@ -211,33 +230,28 @@ validate_configuration() {
       ;;
   esac
 
-  require_uint_at_least "FC_EVAL_START_SEED" "${START_SEED}" 0
-  require_uint_at_least "FC_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
+  require_uint_at_least "HT_EVAL_START_SEED" "${START_SEED}" 0
+  require_uint_at_least "HT_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
   require_uint_at_least "GROOT_EVAL_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
-  require_uint_at_least "FC_EVAL_MAX_STEPS" "${MAX_STEPS}" 1
-  require_uint_at_least "FC_EVAL_OBS_PORT" "${OBS_PORT}" 1
-  require_uint_at_least "FC_EVAL_ACT_PORT" "${ACT_PORT}" 1
-  require_uint_at_least "FC_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
-  require_uint_at_least "FC_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
+  require_uint_at_least "HT_EVAL_WORKER_START_TIMEOUT_S" "${WORKER_START_TIMEOUT_S}" 1
+  require_uint_at_least "HT_EVAL_ATTEMPT_TIMEOUT_S" "${ATTEMPT_TIMEOUT_S}" 1
+  require_uint_at_least "HT_EVAL_OBS_PORT" "${OBS_PORT}" 1
+  require_uint_at_least "HT_EVAL_ACT_PORT" "${ACT_PORT}" 1
+  require_uint_at_least "HT_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
+  require_uint_at_least "HT_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
   require_uint_at_least "GROOT_PRINT_EVERY" "${GROOT_PRINT_EVERY}" 0
-  require_uint_at_least "FC_EVAL_VIDEO_WIDTH" "${VIDEO_WIDTH}" 2
-  require_uint_at_least "FC_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
-  require_uint_at_least "FC_EVAL_VIDEO_STRIDE" "${VIDEO_STRIDE}" 1
+  require_uint_at_least "HT_EVAL_VIDEO_WIDTH" "${VIDEO_WIDTH}" 2
+  require_uint_at_least "HT_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
+  require_uint_at_least "HT_EVAL_VIDEO_STRIDE" "${VIDEO_STRIDE}" 1
 
-  ((10#${OBS_PORT} <= 65535)) || die "FC_EVAL_OBS_PORT must be <= 65535"
-  ((10#${ACT_PORT} <= 65535)) || die "FC_EVAL_ACT_PORT must be <= 65535"
+  ((10#${OBS_PORT} <= 65535)) || die "HT_EVAL_OBS_PORT must be <= 65535"
+  ((10#${ACT_PORT} <= 65535)) || die "HT_EVAL_ACT_PORT must be <= 65535"
   [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
-  [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" || "${USE_BENCHMARK_MAX_STEPS}" == "1" ]] \
-    || die "FC_EVAL_USE_BENCHMARK_MAX_STEPS must be 0 or 1"
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
-    || die "FC_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
-  [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
-    || die "FC_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
-  [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
-    || die "FC_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
-  [[ -n "${FC_EVAL_CUDA_VISIBLE_DEVICES}" ]] || die "FC_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
-  [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || die "FC_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
+    || die "HT_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
+  [[ -n "${HT_EVAL_CUDA_VISIBLE_DEVICES}" ]] || die "HT_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || die "HT_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
 
 terminate_process() {
@@ -263,8 +277,9 @@ trap 'exit 143' TERM
 
 build_commands() {
   local benchmark_config="$1"
-  local video_dir="$2"
-  local video_name="$3"
+  local task_max_steps="$2"
+  local video_dir="$3"
+  local video_name="$4"
   local server_python_command=()
 
   if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
@@ -295,8 +310,16 @@ build_commands() {
     "${NUM_TRIALS}"
     --attempts_per_worker
     "${ATTEMPTS_PER_WORKER}"
+    --worker_start_timeout_s
+    "${WORKER_START_TIMEOUT_S}"
+    --attempt_timeout_s
+    "${ATTEMPT_TIMEOUT_S}"
+    --max_steps
+    "${task_max_steps}"
     --initial_position_mode
-    "${INITIAL_POSITION_MODE}"
+    fixed
+    --visual_asset_variance_scope
+    fixed
     --device
     "${MOTIONFORGE_DEVICE}"
     --obs_port
@@ -315,12 +338,6 @@ build_commands() {
     "${VIDEO_STRIDE}"
   )
 
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" ]]; then
-    SERVER_COMMAND+=(--max_steps "${MAX_STEPS}")
-  fi
-  if [[ -n "${MOTION_LEVEL}" ]]; then
-    SERVER_COMMAND+=(--motion_level "${MOTION_LEVEL}")
-  fi
   if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
     SERVER_COMMAND+=(--video_outcome_suffix)
   fi
@@ -369,7 +386,7 @@ print_command() {
 
 print_bridge_command() {
   printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q GR00T_BACKBONE_MODEL_PATH=%q LD_LIBRARY_PATH=%q HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ' \
-    "${GROOT_ROOT}" "${FC_EVAL_CUDA_VISIBLE_DEVICES}" "${GROOT_BACKBONE_MODEL_PATH}" "${GROOT_FFMPEG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    "${GROOT_ROOT}" "${HT_EVAL_CUDA_VISIBLE_DEVICES}" "${GROOT_BACKBONE_MODEL_PATH}" "${GROOT_FFMPEG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
   printf '%q ' "${BRIDGE_COMMAND[@]}"
   printf ')\n'
 }
@@ -481,8 +498,9 @@ validate_video_outputs() {
 append_failed_task() {
   local task_id="$1"
   local benchmark_config="$2"
-  local video_dir="$3"
-  local reason="$4"
+  local task_max_steps="$3"
+  local video_dir="$4"
+  local reason="$5"
   local video_count=""
   local trials="N/A"
   local successes="N/A"
@@ -499,6 +517,7 @@ append_failed_task() {
     printf '\n[%s]\n' "${task_id}"
     printf 'status=failed\n'
     printf 'benchmark=%s\n' "${benchmark_config}"
+    printf 'max_steps=%s\n' "${task_max_steps}"
     printf 'trials=%s\n' "${trials}"
     printf 'successes=%s\n' "${successes}"
     printf 'failures=%s\n' "${failures}"
@@ -512,13 +531,15 @@ append_failed_task() {
 append_completed_task() {
   local task_id="$1"
   local benchmark_config="$2"
-  local video_dir="$3"
+  local task_max_steps="$3"
+  local video_dir="$4"
   local video_count=""
   video_count="$(count_videos "${video_dir}")"
   {
     printf '\n[%s]\n' "${task_id}"
     printf 'status=completed\n'
     printf 'benchmark=%s\n' "${benchmark_config}"
+    printf 'max_steps=%s\n' "${task_max_steps}"
     printf 'trials=%s\n' "${LAST_TRIALS}"
     printf 'successes=%s\n' "${LAST_SUCCESSES}"
     printf 'failures=%s\n' "${LAST_FAILURES}"
@@ -531,6 +552,7 @@ append_completed_task() {
 run_task() {
   local task_id="$1"
   local benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+  local task_max_steps=""
   local task_result_dir="${RESULT_DIR}/${task_id}"
   local server_log="${task_result_dir}/server.log"
   local client_log="${task_result_dir}/client.log"
@@ -538,34 +560,36 @@ run_task() {
   local video_name="${task_id}_rollout.mp4"
   local process_status=0
 
+  task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
   LAST_TRIALS=0
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
 
   mkdir -p "${video_dir}" || return 1
-  build_commands "${benchmark_config}" "${video_dir}" "${video_name}"
+  build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${video_name}"
 
-  local max_steps_label="${MAX_STEPS}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  fi
-
-  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
   log "server_log=${server_log}"
   log "client_log=${client_log}"
 
   (
     cd -- "${MOTIONFORGE_ROOT}"
-    export CUDA_VISIBLE_DEVICES="${FC_EVAL_CUDA_VISIBLE_DEVICES}"
+    export CUDA_VISIBLE_DEVICES="${HT_EVAL_CUDA_VISIBLE_DEVICES}"
     export OMNI_KIT_ACCEPT_EULA="YES"
+    export MOTIONFORGE_LIGHTING_MODE="fixed"
+    unset MOTIONFORGE_LIGHTING_PROFILE MOTIONFORGE_LIGHTING_BRIGHTNESS
+    unset MOTIONFORGE_LIGHTING_DIRECTION MOTIONFORGE_LIGHTING_COLOR MOTIONFORGE_LIGHTING_SEED
+    unset MOTIONFORGE_BACKGROUND_PROFILE MOTIONFORGE_BACKGROUND_ASSET_ID
+    unset MOTIONFORGE_BACKGROUND_MODE MOTIONFORGE_BACKGROUND_SEED
+    unset MOTIONFORGE_VISUAL_ASSET_MODE MOTIONFORGE_VISUAL_ASSET_SEED
     exec "${SERVER_COMMAND[@]}"
   ) >"${server_log}" 2>&1 &
   SERVER_PID="$!"
 
   (
     cd -- "${GROOT_ROOT}"
-    export CUDA_VISIBLE_DEVICES="${FC_EVAL_CUDA_VISIBLE_DEVICES}"
+    export CUDA_VISIBLE_DEVICES="${HT_EVAL_CUDA_VISIBLE_DEVICES}"
     export GR00T_BACKBONE_MODEL_PATH="${GROOT_BACKBONE_MODEL_PATH}"
     export LD_LIBRARY_PATH="${GROOT_FFMPEG_PREFIX}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     export HF_HUB_OFFLINE=1
@@ -580,21 +604,21 @@ run_task() {
     process_status="$?"
   fi
   if ((process_status != 0)); then
-    append_failed_task "${task_id}" "${benchmark_config}" "${video_dir}" "server/client process exit status ${process_status}"
+    append_failed_task "${task_id}" "${benchmark_config}" "${task_max_steps}" "${video_dir}" "server/client process exit status ${process_status}"
     return "${process_status}"
   fi
 
   if ! parse_task_summary "${server_log}"; then
-    append_failed_task "${task_id}" "${benchmark_config}" "${video_dir}" "server log has no valid ${NUM_TRIALS}-trial summary"
+    append_failed_task "${task_id}" "${benchmark_config}" "${task_max_steps}" "${video_dir}" "server log has no valid ${NUM_TRIALS}-trial summary"
     return 1
   fi
 
   if ! validate_video_outputs "${task_id}" "${video_dir}"; then
-    append_failed_task "${task_id}" "${benchmark_config}" "${video_dir}" "expected ${NUM_TRIALS} non-empty rollout videos"
+    append_failed_task "${task_id}" "${benchmark_config}" "${task_max_steps}" "${video_dir}" "expected ${NUM_TRIALS} non-empty rollout videos"
     return 1
   fi
 
-  append_completed_task "${task_id}" "${benchmark_config}" "${video_dir}"
+  append_completed_task "${task_id}" "${benchmark_config}" "${task_max_steps}" "${video_dir}"
   log "completed task=${task_id} successes=${LAST_SUCCESSES}/${LAST_TRIALS} success_rate=${LAST_SUCCESS_RATE}"
   return 0
 }
@@ -638,18 +662,15 @@ append_overall_summary() {
 validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
-  max_steps_label="${MAX_STEPS}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  fi
   log "validated configuration; no process or result directory will be created"
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "result_dir=${RESULT_DIR}"
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
     video_dir="${RESULT_DIR}/${task_id}/videos"
-    build_commands "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-    log "dry-run task=${task_id} benchmark=${benchmark_config}"
+    build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
+    log "dry-run task=${task_id} max_steps=${task_max_steps} benchmark=${benchmark_config}"
     print_command "${MOTIONFORGE_ROOT}" "${SERVER_COMMAND[@]}"
     print_bridge_command
   done
@@ -657,31 +678,29 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 if [[ -e "${RESULT_DIR}" ]]; then
-  die "result directory already exists; choose another FC_EVAL_RUN_ID: ${RESULT_DIR}"
+  die "result directory already exists; choose another HT_EVAL_RUN_ID: ${RESULT_DIR}"
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'FC000-FC009 MotionForge evaluation\n'
+  printf 'HT000-HT009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${GROOT_MODEL_PATH}"
   printf 'accel_mode=%s\n' "${GROOT_ACCEL_MODE}"
   printf 'trt_engine_path=%s\n' "${GROOT_TRT_ENGINE_PATH}"
   printf 'backbone_model_path=%s\n' "${GROOT_BACKBONE_MODEL_PATH}"
-  printf 'cuda_visible_devices=%s\n' "${FC_EVAL_CUDA_VISIBLE_DEVICES}"
+  printf 'cuda_visible_devices=%s\n' "${HT_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
+  printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
   printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    printf 'max_steps_per_trial=benchmark_config\n'
-  else
-    printf 'max_steps_per_trial=%s\n' "${MAX_STEPS}"
-  fi
-  printf 'motion_level=%s\n' "${MOTION_LEVEL:-benchmark_config}"
+  printf 'max_steps_source=benchmark_config\n'
   printf 'timing_source=benchmark_config\n'
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
-  printf 'initial_position_mode=%s\n' "${INITIAL_POSITION_MODE}"
+  printf 'initial_position_mode=fixed\n'
+  printf 'visual_asset_variance_scope=fixed\n'
+  printf 'lighting_mode=fixed\n'
   printf 'video_enabled=true\n'
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"
@@ -723,3 +742,4 @@ append_overall_summary \
 log "results=${RESULT_DIR}"
 log "summary=${SUMMARY_FILE}"
 exit "${overall_status}"
+

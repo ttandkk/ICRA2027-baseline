@@ -2,7 +2,7 @@
 
 ## 1. 目的与结论
 
-本文记录 `SmolVLA-FC-80000` checkpoint 在 MotionForge FC001–FC009 评测中的训练—推理一致性审计结果，覆盖图像、机器人状态、语言指令、动作表示、归一化和时间语义。
+本文记录 `SmolVLA-FC-80000` checkpoint 在 MotionForge FC000–FC009 评测中的训练—推理一致性审计结果，覆盖图像、机器人状态、语言指令、动作表示、归一化和时间语义。
 
 审计日期：2026-08-25。
 
@@ -40,12 +40,12 @@ MotionForge camera/state/oracle action
   → SmolVLA
 
 推理：
-MotionForge ObservationPacket
+MotionForge ObservationRequest
   → motionforge_smolvla_bridge_client.py
   → checkpoint preprocessor
   → SmolVLA.predict_action_chunk
   → checkpoint postprocessor
-  → MotionForge ActionPacket
+  → shared client 统一为 16-step ActionResponse
   → ActionAdapter
   → Isaac 8D absolute pose action
 ```
@@ -63,7 +63,7 @@ MotionForge ObservationPacket
 | State normalization | `MEAN_STD` | checkpoint preprocessor | 一致 |
 | Action normalization | `MEAN_STD` | checkpoint postprocessor 反归一化 | 一致 |
 | 图像 normalization | `IDENTITY`，模型内部转 `[-1,1]` | 相同 policy 代码路径 | 一致 |
-| Chunk | 50 steps | 预测 50，发送前 16 | 模型 contract 一致；发送范围按评测协议裁剪 |
+| Chunk | 50 steps | 预测 50；共享 client 校验后发送前 16 | 模型 contract 一致；wire horizon 由正式协议统一 |
 
 ## 5. Checkpoint 与 processor
 
@@ -218,12 +218,14 @@ gripper_max_abs_error=0
 时间语义：
 
 - policy 训练和输出 50 个连续 action steps。
-- 统一评测协议为 30 Hz。
-- bridge 发送前 16 步，并声明 execution horizon 8。
-- MotionForge 将 30 Hz action 插值到 120 Hz control clock。
-- `observation_aligned` 模式会根据端到端推理延迟跳过已过期的动作前缀。
+- 唯一正式协议为 `motionforge.server_scheduled`；Factory Conveyor 显式选择 120 Hz control / 30 Hz source-action timing profile。
+- shared client 要求模型至少返回 16 步，并统一发送前 16 个 30 Hz source actions；客户端不声明 request rate、action Hz 或 execution horizon。
+- 服务端实测 request 首次发送到 action 完成解码/校验的 E2E 延迟，并据此决定激活 control step。
+- 新计划在激活时刻从 `A0` 开始；不按延迟裁掉动作前缀，也没有额外 execution cap，完整 16-step source plan 可被执行。
+- 服务端独占请求频率、source/control 重采样、request lead、buffer replacement 和 underrun 诊断。
+- warmup 与正式 episode 之间通过第二次 RESET 隔离；共享 lifecycle 清 request cache，bridge 的 `reset(reset)` 清 policy/pre/post state 后才处理正式首帧。
 
-注意：在当前 `wall_clock_strict` 模式下，`execution_horizon=8` 是 packet metadata，不是服务端的硬截断上限；服务端使用 latency-aware request/queue replacement。只有 synchronous scheduler 会按该字段硬裁剪。因此不能把当前评测解释为原生 SmolVLA 连续执行全部 50 步，也不能简单解释为每次严格执行 8 步。
+因此当前评测不能解释为连续执行模型原生全部 50 步，也不存在“每次固定执行 8 步”或客户端按推理耗时裁 action 的语义。推理延迟只通过服务端激活时刻和潜在 buffer underrun 进入任务。
 
 ## 9. 模型加载一致性
 
@@ -270,11 +272,11 @@ SmolVLAPolicy.from_pretrained(
 - 训练数据名称为 `factory_conveyor_level2_seeded`。
 - 当前统一评测协议使用 `initial_position_mode=fixed`。
 - 二者具有初始位置分布差异，可能影响成功率，但不改变输入输出字段语义。
-- GPU 并发导致的 realtime deadline miss 也可能影响成功率，不应误判为 normalization 或 action-format 错误。
+- GPU 并发导致的 E2E 延迟增长和 buffer underrun 也可能影响成功率，不应误判为 normalization 或 action-format 错误。
 
 ## 11. 验证记录
 
-已执行：
+2026-08-25 审计时已执行：
 
 ```text
 checkpoint config/train policy JSON equality: passed
@@ -297,7 +299,7 @@ PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' \
   source/motionforge/tests/test_benchmark_realtime.py
 ```
 
-结果：`40 passed in 1.50s`。
+历史结果：`40 passed in 1.50s`。该结果不代表本轮 server-scheduled 协议迁移测试已经运行；本轮结果以迁移报告为准。
 
 LeRobot 环境当前未安装 `pytest`，因此没有直接运行完整的 `tests/processor/test_smolvla_processor.py`；本次使用 checkpoint 自带 processor 完成了等价的关键动态路径验证，没有为审计额外安装依赖。
 

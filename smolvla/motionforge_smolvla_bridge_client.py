@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import random
+import sys
 import time
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
@@ -14,9 +17,19 @@ from typing import Any
 import numpy as np
 import torch
 
+_motionforge_root = Path(
+    os.environ.get(
+        "MOTIONFORGE_ROOT",
+        Path(__file__).resolve().parents[2] / "MotionForge",
+    )
+)
+_motionforge_source = str(_motionforge_root / "source" / "motionforge")
+if _motionforge_source not in sys.path:
+    sys.path.insert(0, _motionforge_source)
 
-PROTOCOL_VERSION = "motionforge.benchmark.v1"
-ACTION_KEY = "eef_xyz_rot6d_gripper"
+from motionforge.benchmark.client import BenchmarkClientBridge, ClientBridgeConfig
+from motionforge.benchmark.protocol import ObservationRequest, ResetMessage
+
 IMAGE_KEYS = (
     "observation.images.overview",
     "observation.images.front",
@@ -26,56 +39,14 @@ STATE_KEY = "observation.state"
 TASK_KEY = "task"
 
 
-@dataclass(slots=True)
-class MotionForgeTransport:
-    """Minimal ZMQ transport for MotionForge benchmark packets."""
-
-    host: str
-    obs_port: int
-    act_port: int
-    recv_timeout_ms: int
-    send_timeout_ms: int
-
-    _zmq: Any = field(init=False)
-    _context: Any = field(init=False)
-    _obs_socket: Any = field(init=False)
-    _act_socket: Any = field(init=False)
-
-    def __post_init__(self) -> None:
-        import zmq
-
-        self._zmq = zmq
-        self._context = zmq.Context()
-        self._obs_socket = self._context.socket(zmq.SUB)
-        self._obs_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self._obs_socket.setsockopt(zmq.RCVHWM, 16)
-        self._obs_socket.connect(f"tcp://{self.host}:{self.obs_port}")
-
-        self._act_socket = self._context.socket(zmq.PUSH)
-        self._act_socket.setsockopt(zmq.SNDHWM, 16)
-        self._act_socket.setsockopt(zmq.SNDTIMEO, self.send_timeout_ms)
-        self._act_socket.connect(f"tcp://{self.host}:{self.act_port}")
-
-    def receive(self) -> dict[str, Any] | None:
-        if self._obs_socket.poll(timeout=self.recv_timeout_ms) == 0:
-            return None
-        message = self._obs_socket.recv_pyobj()
-        if not isinstance(message, dict):
-            raise TypeError(f"Expected a dict packet, got {type(message).__name__}.")
-        return message
-
-    def send(self, packet: dict[str, Any]) -> None:
-        try:
-            self._act_socket.send_pyobj(packet)
-        except self._zmq.Again as exc:
-            raise TimeoutError(
-                f"Timed out sending an action to tcp://{self.host}:{self.act_port}."
-            ) from exc
-
-    def close(self) -> None:
-        self._obs_socket.close(linger=0)
-        self._act_socket.close(linger=0)
-        self._context.term()
+def seed_policy_rng(seed: int) -> None:
+    if not 0 <= int(seed) < 2**63 - 1:
+        raise ValueError(f"RESET seed must be in [0, 2**63 - 2], got {seed}.")
+    random.seed(int(seed))
+    np.random.seed(int(seed) % 2**32)
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
 
 @dataclass(slots=True)
@@ -130,7 +101,9 @@ class SmolVLAInference:
     def action_horizon(self) -> int:
         return int(self.config.chunk_size)
 
-    def reset(self) -> None:
+    def reset(self, reset: ResetMessage) -> None:
+        """Clear all model-side state for every server RESET phase."""
+        seed_policy_rng(int(reset.seed))
         self.policy.reset()
         self.preprocessor.reset()
         self.postprocessor.reset()
@@ -155,6 +128,9 @@ class SmolVLAInference:
             raise ValueError("SmolVLA produced non-finite actions.")
         return array
 
+    def predict(self, observation: ObservationRequest) -> np.ndarray:
+        return self.predict_chunk(observation.to_dict())
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -164,22 +140,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motionforge-obs-port", type=int, default=3196)
     parser.add_argument("--motionforge-act-port", type=int, default=3198)
     parser.add_argument("--num-episodes", type=int, default=1)
-    parser.add_argument("--action-hz", type=float, default=30.0)
-    parser.add_argument("--max-inference-hz", type=float, default=30.0)
-    parser.add_argument(
-        "--send-horizon",
-        type=int,
-        default=16,
-        help="Number of leading SmolVLA actions sent to MotionForge; GR00T FC sends 16.",
-    )
-    parser.add_argument(
-        "--execution-horizon",
-        type=int,
-        default=8,
-        help="Execution horizon advertised in packet metadata; GR00T FC uses 8.",
-    )
-    parser.add_argument("--recv-timeout-ms", type=int, default=100)
-    parser.add_argument("--send-timeout-ms", type=int, default=10000)
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument(
         "--validate-checkpoint",
@@ -193,16 +153,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--motionforge-act-port must be in [1, 65535]")
     if args.motionforge_obs_port == args.motionforge_act_port:
         parser.error("observation and action ports must differ")
-    if args.num_episodes < 0:
-        parser.error("--num-episodes must be >= 0")
-    if args.action_hz <= 0 or args.max_inference_hz <= 0:
-        parser.error("action and inference frequencies must be positive")
-    if args.send_horizon < 1:
-        parser.error("--send-horizon must be >= 1")
-    if not 1 <= args.execution_horizon <= args.send_horizon:
-        parser.error("--execution-horizon must be in [1, --send-horizon]")
-    if args.recv_timeout_ms < 1 or args.send_timeout_ms < 1:
-        parser.error("transport timeouts must be positive")
+    if args.num_episodes < 1:
+        parser.error("--num-episodes must be >= 1")
     if args.print_every < 0:
         parser.error("--print-every must be >= 0")
     return args
@@ -241,7 +193,6 @@ def load_smolvla_config(checkpoint: Path, device: str) -> Any:
 def build_smolvla_observation(
     message: dict[str, Any], input_features: dict[str, Any]
 ) -> dict[str, torch.Tensor | str]:
-    require_protocol(message)
     expected_keys = set(input_features)
     required_keys = {STATE_KEY, *IMAGE_KEYS}
     if expected_keys != required_keys:
@@ -296,58 +247,6 @@ def require_field(message: dict[str, Any], key: str) -> Any:
     return message[key]
 
 
-def require_protocol(message: dict[str, Any]) -> None:
-    protocol = message.get("protocol_version")
-    if protocol != PROTOCOL_VERSION:
-        raise ValueError(
-            f"Unsupported MotionForge protocol {protocol!r}; expected {PROTOCOL_VERSION!r}."
-        )
-
-
-def action_packet(
-    *,
-    actions: np.ndarray,
-    message: dict[str, Any],
-    action_horizon: int,
-    execution_horizon: int,
-    inference_duration_s: float,
-    action_hz: float,
-    max_inference_hz: float,
-) -> dict[str, Any]:
-    send_horizon = int(actions.shape[0])
-    if not 1 <= execution_horizon <= send_horizon <= action_horizon:
-        raise ValueError(
-            "Expected 1 <= execution_horizon <= send_horizon <= action_horizon, got "
-            f"{execution_horizon}, {send_horizon}, and {action_horizon}."
-        )
-    observation_index = int(require_field(message, "index"))
-    packet: dict[str, Any] = {
-        "protocol_version": PROTOCOL_VERSION,
-        # Use a built-in wire type so NumPy 2.x clients remain pickle-compatible
-        # with the MotionForge environment, which currently uses NumPy 1.x.
-        "action": actions.tolist(),
-        "action_key": ACTION_KEY,
-        "action_frame": "robot",
-        "action_representation": "ABSOLUTE",
-        "observation_index": observation_index,
-        "action_hz": float(action_hz),
-        "action_alignment": "observation_aligned",
-        "inference_duration_s": float(inference_duration_s),
-        "max_inference_hz": float(max_inference_hz),
-        "created_time": time.time(),
-        "metadata": {
-            "client": "motionforge_smolvla_bridge",
-            "action_horizon": int(action_horizon),
-            "send_horizon": send_horizon,
-            "execution_horizon": int(execution_horizon),
-            "request_kind": message.get("request_kind"),
-        },
-    }
-    if message.get("request_id") is not None:
-        packet["request_id"] = int(message["request_id"])
-    return packet
-
-
 def installed_lerobot_version() -> str:
     try:
         return version("lerobot")
@@ -357,10 +256,6 @@ def installed_lerobot_version() -> str:
 
 def synthetic_message(inference: SmolVLAInference) -> dict[str, Any]:
     message: dict[str, Any] = {
-        "protocol_version": PROTOCOL_VERSION,
-        "index": 0,
-        "request_id": 0,
-        "request_kind": "validation",
         TASK_KEY: "Pick up the moving cardboard package from the conveyor and place it into the box.",
         STATE_KEY: np.zeros(
             tuple(inference.config.input_features[STATE_KEY].shape), dtype=np.float32
@@ -394,112 +289,40 @@ def main() -> int:
     args = parse_args()
     current_version = installed_lerobot_version()
     inference = SmolVLAInference(checkpoint=args.model_path, device=args.device)
-    if args.send_horizon > inference.action_horizon:
-        raise ValueError(
-            f"--send-horizon={args.send_horizon} exceeds checkpoint action horizon "
-            f"{inference.action_horizon}."
-        )
     print(
         "[MOTIONFORGE-SMOLVLA] loaded "
         f"checkpoint={inference.checkpoint} device={args.device} "
         f"lerobot={current_version} action_horizon={inference.action_horizon} "
-        f"send_horizon={args.send_horizon} execution_horizon={args.execution_horizon}",
+        "wire_horizon=server_required_16",
         flush=True,
     )
     if args.validate_checkpoint:
         return run_validation(inference)
 
-    transport = MotionForgeTransport(
-        host=args.motionforge_host,
-        obs_port=args.motionforge_obs_port,
-        act_port=args.motionforge_act_port,
-        recv_timeout_ms=args.recv_timeout_ms,
-        send_timeout_ms=args.send_timeout_ms,
-    )
-    episodes = 0
-    observations = 0
-    actions_sent = 0
-    episode_observations = 0
-    processed_request_ids: set[int] = set()
     print(
         "[MOTIONFORGE-SMOLVLA] listening "
         f"host={args.motionforge_host} obs_port={args.motionforge_obs_port} "
         f"act_port={args.motionforge_act_port}",
         flush=True,
     )
+    bridge = BenchmarkClientBridge(
+        policy=inference,
+        config=ClientBridgeConfig(
+            host=args.motionforge_host,
+            obs_port=int(args.motionforge_obs_port),
+            act_port=int(args.motionforge_act_port),
+            num_episodes=int(args.num_episodes),
+            print_every=int(args.print_every),
+        ),
+        log=lambda message: print(f"[MOTIONFORGE-SMOLVLA] {message}", flush=True),
+    )
     try:
-        while True:
-            message = transport.receive()
-            if message is None:
-                continue
-            if "episode_result" in message:
-                episodes += 1
-                print(
-                    "[MOTIONFORGE-SMOLVLA] episode_result "
-                    f"episode={episodes} observations={episode_observations} "
-                    f"result={message['episode_result']}",
-                    flush=True,
-                )
-                inference.reset()
-                processed_request_ids.clear()
-                episode_observations = 0
-                if args.num_episodes and episodes >= args.num_episodes:
-                    break
-                continue
-
-            require_protocol(message)
-
-            request_id_value = message.get("request_id")
-            request_id = None if request_id_value is None else int(request_id_value)
-            if request_id is not None and request_id in processed_request_ids:
-                print(
-                    f"[MOTIONFORGE-SMOLVLA] duplicate_request request_id={request_id}",
-                    flush=True,
-                )
-                continue
-            if request_id == 0 and message.get("request_kind") == "warmup":
-                inference.reset()
-                processed_request_ids.clear()
-
-            observations += 1
-            episode_observations += 1
-            started_at = time.perf_counter()
-            predicted_actions = inference.predict_chunk(message)
-            inference_duration_s = time.perf_counter() - started_at
-            actions = np.ascontiguousarray(predicted_actions[: args.send_horizon])
-            packet = action_packet(
-                actions=actions,
-                message=message,
-                action_horizon=inference.action_horizon,
-                execution_horizon=args.execution_horizon,
-                inference_duration_s=inference_duration_s,
-                action_hz=args.action_hz,
-                max_inference_hz=args.max_inference_hz,
-            )
-            transport.send(packet)
-            actions_sent += 1
-            if request_id is not None:
-                processed_request_ids.add(request_id)
-            if args.print_every and (actions_sent == 1 or actions_sent % args.print_every == 0):
-                print(
-                    "[MOTIONFORGE-SMOLVLA] action_sent "
-                    f"count={actions_sent} request_id={request_id} "
-                    f"observation_index={packet['observation_index']} "
-                    f"predicted_shape={predicted_actions.shape} sent_shape={actions.shape} "
-                    f"inference_s={inference_duration_s:.3f}",
-                    flush=True,
-                )
+        bridge.run()
     except KeyboardInterrupt:
         print("[MOTIONFORGE-SMOLVLA] interrupted", flush=True)
         return 130
-    finally:
-        transport.close()
 
-    print(
-        "[MOTIONFORGE-SMOLVLA] done "
-        f"episodes={episodes} observations={observations} actions_sent={actions_sent}",
-        flush=True,
-    )
+    print(f"[MOTIONFORGE-SMOLVLA] done episodes={args.num_episodes}", flush=True)
     return 0
 
 

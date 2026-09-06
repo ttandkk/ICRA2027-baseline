@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=smolvla_cm000_cm010_eval
+#SBATCH --job-name=smolvla_cm000_cm009_eval
 #SBATCH --partition=cluster02
 #SBATCH --gres=gpu:rtx5090:1
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --output=logs/smolvla_cm000_cm010_eval_%j.out
-#SBATCH --error=logs/smolvla_cm000_cm010_eval_%j.err
+#SBATCH --output=logs/smolvla_cm000_cm009_eval_%j.out
+#SBATCH --error=logs/smolvla_cm000_cm009_eval_%j.err
 
 set -Eeuo pipefail
 
@@ -29,11 +29,6 @@ RUNTIME_ASSET_DIR="${MOTIONFORGE_ROOT}/source/motionforge/motionforge/assets/run
 SMOLVLA_MODEL_PATH="${SMOLVLA_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/SmolVLA/CM-80000}"
 SMOLVLA_PYTHON="${SMOLVLA_PYTHON:-${WORKSPACE_ROOT}/miniconda3/envs/lerobot/bin/python}"
 SMOLVLA_DEVICE="${SMOLVLA_DEVICE:-cuda:0}"
-SMOLVLA_ACTION_HZ="${SMOLVLA_ACTION_HZ:-30}"
-SMOLVLA_MAX_INFERENCE_HZ="${SMOLVLA_MAX_INFERENCE_HZ:-30}"
-SMOLVLA_SEND_HORIZON="${SMOLVLA_SEND_HORIZON:-16}"
-SMOLVLA_EXECUTION_HORIZON="${SMOLVLA_EXECUTION_HORIZON:-8}"
-SMOLVLA_ACTION_ALIGNMENT="${SMOLVLA_ACTION_ALIGNMENT:-observation_aligned}"
 SMOLVLA_PRINT_EVERY="${SMOLVLA_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
@@ -49,10 +44,9 @@ TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
 START_SEED="${SMOLVLA_EVAL_START_SEED:-0}"
 NUM_TRIALS="${SMOLVLA_EVAL_NUM_TRIALS:-10}"
-CLOCK_MODE="${SMOLVLA_EVAL_CLOCK_MODE:-slowdown_scaled}"
+ATTEMPTS_PER_WORKER="${MOTIONFORGE_ATTEMPTS_PER_WORKER:-50}"
 OBS_PORT="${SMOLVLA_EVAL_OBS_PORT:-3396}"
 ACT_PORT="${SMOLVLA_EVAL_ACT_PORT:-3398}"
-CLIENT_WARMUP_S="${SMOLVLA_EVAL_CLIENT_WARMUP_S:-5}"
 TASK_TIMEOUT_S="${SMOLVLA_EVAL_TASK_TIMEOUT_S:-14400}"
 BETWEEN_TASKS_S="${SMOLVLA_EVAL_BETWEEN_TASKS_S:-5}"
 
@@ -61,11 +55,12 @@ VIDEO_HEIGHT="${SMOLVLA_EVAL_VIDEO_HEIGHT:-480}"
 VIDEO_STRIDE="${SMOLVLA_EVAL_VIDEO_STRIDE:-1}"
 VIDEO_OUTCOME_SUFFIX="${SMOLVLA_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/output"
-RUN_ID="${SMOLVLA_EVAL_RUN_ID:-smolvla_cm000_cm010_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${SMOLVLA_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output}"
+RUN_ID="${SMOLVLA_EVAL_RUN_ID:-smolvla_cm000_cm009_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
+OOD_LIGHTING="${SMOLVLA_EVAL_OOD_LIGHTING-0}"
 
 DEFAULT_TASK_IDS=(
   cm_000
@@ -74,10 +69,10 @@ DEFAULT_TASK_IDS=(
   cm_003
   cm_004
   cm_005
+  cm_006
   cm_007
   cm_008
   cm_009
-  cm_010
 )
 
 if [[ -n "${SMOLVLA_EVAL_TASKS:-}" ]]; then
@@ -95,14 +90,13 @@ LAST_TRIALS=0
 LAST_SUCCESSES=0
 LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
-LAST_RAW_SUMMARY=""
 
 log() {
-  printf '[SMOLVLA-CM000-CM010-EVAL] %s\n' "$*"
+  printf '[SMOLVLA-CM000-CM009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[SMOLVLA-CM000-CM010-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[SMOLVLA-CM000-CM009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -128,13 +122,6 @@ require_uint_at_least() {
   if ! [[ "${value}" =~ ^[0-9]+$ ]] || ((10#${value} < minimum)); then
     die "${name} must be an integer >= ${minimum}, got ${value}"
   fi
-}
-
-require_positive_number() {
-  local name="$1"
-  local value="$2"
-  awk -v value="${value}" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value > 0) }' \
-    || die "${name} must be a positive number, got ${value}"
 }
 
 benchmark_max_steps() {
@@ -275,24 +262,20 @@ validate_bridge_contract() {
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
     "${SMOLVLA_PYTHON}" -c '
 import sys
-import numpy as np
+import inspect
 
 sys.path.insert(0, sys.argv[1])
-from motionforge_smolvla_bridge_client import action_packet
+import motionforge_smolvla_bridge_client as client
+from motionforge.benchmark.protocol import PROTOCOL
 
-packet = action_packet(
-    actions=np.zeros((16, 10), dtype=np.float32),
-    message={"protocol_version": "motionforge.benchmark.v1", "index": 0, "request_id": 1},
-    action_horizon=50,
-    execution_horizon=8,
-    inference_duration_s=0.1,
-    action_hz=30,
-    max_inference_hz=30,
-)
-assert packet["action_alignment"] == "observation_aligned"
-assert packet["action_representation"] == "ABSOLUTE"
-assert len(packet["action"]) == 16
-assert packet["metadata"]["execution_horizon"] == 8
+assert PROTOCOL == "motionforge.server_scheduled"
+assert list(inspect.signature(client.SmolVLAInference.reset).parameters) == ["self", "reset"]
+assert list(inspect.signature(client.SmolVLAInference.predict).parameters) == [
+    "self",
+    "observation",
+]
+assert not hasattr(client, "MotionForgeTransport")
+assert not hasattr(client, "action_packet")
 ' "${SCRIPT_DIR}" || die "SmolVLA bridge does not match the CM realtime action contract"
 }
 
@@ -341,11 +324,6 @@ validate_configuration() {
 
   [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die \
     "MOTIONFORGE_DEVICE must be cpu for CM evaluation; GPU PhysX makes rotating compound/articulated payloads sink"
-  [[ "${CLOCK_MODE}" == "slowdown_scaled" ]] || die \
-    "SMOLVLA_EVAL_CLOCK_MODE must be slowdown_scaled for CM v2 evaluation; got ${CLOCK_MODE}"
-  [[ "${SMOLVLA_ACTION_ALIGNMENT}" == "observation_aligned" ]] || die \
-    "SMOLVLA_ACTION_ALIGNMENT must be observation_aligned for realtime CM evaluation; got ${SMOLVLA_ACTION_ALIGNMENT}"
-
   ((${#TASK_IDS[@]} > 0)) || die "SMOLVLA_EVAL_TASKS must select at least one task"
   for task_id in "${TASK_IDS[@]}"; do
     [[ "${task_id}" =~ ^cm_(00[0-9]|010)$ ]] || die "invalid CM task id: ${task_id}"
@@ -357,28 +335,25 @@ validate_configuration() {
 
   require_uint_at_least "SMOLVLA_EVAL_START_SEED" "${START_SEED}" 0
   require_uint_at_least "SMOLVLA_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
+  require_uint_at_least "MOTIONFORGE_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
   require_uint_at_least "SMOLVLA_EVAL_OBS_PORT" "${OBS_PORT}" 1
   require_uint_at_least "SMOLVLA_EVAL_ACT_PORT" "${ACT_PORT}" 1
-  require_uint_at_least "SMOLVLA_EVAL_CLIENT_WARMUP_S" "${CLIENT_WARMUP_S}" 0
   require_uint_at_least "SMOLVLA_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
   require_uint_at_least "SMOLVLA_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
   require_uint_at_least "SMOLVLA_PRINT_EVERY" "${SMOLVLA_PRINT_EVERY}" 0
-  require_uint_at_least "SMOLVLA_SEND_HORIZON" "${SMOLVLA_SEND_HORIZON}" 1
-  require_uint_at_least "SMOLVLA_EXECUTION_HORIZON" "${SMOLVLA_EXECUTION_HORIZON}" 1
   require_uint_at_least "SMOLVLA_EVAL_VIDEO_WIDTH" "${VIDEO_WIDTH}" 2
   require_uint_at_least "SMOLVLA_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
   require_uint_at_least "SMOLVLA_EVAL_VIDEO_STRIDE" "${VIDEO_STRIDE}" 1
-  require_positive_number "SMOLVLA_ACTION_HZ" "${SMOLVLA_ACTION_HZ}"
-  require_positive_number "SMOLVLA_MAX_INFERENCE_HZ" "${SMOLVLA_MAX_INFERENCE_HZ}"
-
-  ((10#${SMOLVLA_EXECUTION_HORIZON} <= 10#${SMOLVLA_SEND_HORIZON})) \
-    || die "SMOLVLA_EXECUTION_HORIZON must be <= SMOLVLA_SEND_HORIZON"
-  ((10#${SMOLVLA_SEND_HORIZON} <= 50)) \
-    || die "SMOLVLA_SEND_HORIZON must be <= the checkpoint action horizon 50"
   ((10#${OBS_PORT} <= 65535)) || die "SMOLVLA_EVAL_OBS_PORT must be <= 65535"
   ((10#${ACT_PORT} <= 65535)) || die "SMOLVLA_EVAL_ACT_PORT must be <= 65535"
   [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
+  [[ "${OOD_LIGHTING}" == "0" || "${OOD_LIGHTING}" == "1" ]] \
+    || die "SMOLVLA_EVAL_OOD_LIGHTING must be 0 or 1"
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "lighting OOD requires all trial seeds to be in 0-49"
+  fi
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
     || die "SMOLVLA_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
   [[ "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
@@ -429,19 +404,21 @@ build_commands() {
     --benchmark_config "${benchmark_config}"
     --seed "${START_SEED}"
     --num_trials "${NUM_TRIALS}"
+    --attempts_per_worker "${ATTEMPTS_PER_WORKER}"
     --max_steps "${task_max_steps}"
     --initial_position_mode fixed
     --device "${MOTIONFORGE_DEVICE}"
     --obs_port "${OBS_PORT}"
     --act_port "${ACT_PORT}"
-    --client_warmup "${CLIENT_WARMUP_S}"
-    --clock_mode "${CLOCK_MODE}"
     --video_dir "${video_dir}"
     --video_name "${video_name}"
     --video_width "${VIDEO_WIDTH}"
     --video_height "${VIDEO_HEIGHT}"
     --video_stride "${VIDEO_STRIDE}"
   )
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_lighting)
+  fi
   if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
     SERVER_COMMAND+=(--video_outcome_suffix)
   fi
@@ -454,10 +431,6 @@ build_commands() {
     --motionforge-obs-port "${OBS_PORT}"
     --motionforge-act-port "${ACT_PORT}"
     --num-episodes "${NUM_TRIALS}"
-    --action-hz "${SMOLVLA_ACTION_HZ}"
-    --max-inference-hz "${SMOLVLA_MAX_INFERENCE_HZ}"
-    --send-horizon "${SMOLVLA_SEND_HORIZON}"
-    --execution-horizon "${SMOLVLA_EXECUTION_HORIZON}"
     --print-every "${SMOLVLA_PRINT_EVERY}"
   )
 }
@@ -523,7 +496,6 @@ parse_task_summary() {
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
   summary_line="$(grep -F '[MOTIONFORGE-BENCH] trials_summary ' "${server_log}" | tail -n 1 || true)"
   [[ -n "${summary_line}" ]] || return 1
   [[ "${summary_line}" =~ ${pattern} ]] || return 1
@@ -531,7 +503,6 @@ parse_task_summary() {
   LAST_SUCCESSES="${BASH_REMATCH[2]}"
   LAST_FAILURES="${BASH_REMATCH[3]}"
   LAST_SUCCESS_RATE="${BASH_REMATCH[4]}"
-  LAST_RAW_SUMMARY="${summary_line}"
   ((10#${LAST_TRIALS} == 10#${NUM_TRIALS})) || return 1
   ((10#${LAST_SUCCESSES} + 10#${LAST_FAILURES} == 10#${LAST_TRIALS})) || return 1
 }
@@ -550,8 +521,8 @@ validate_video_outputs() {
   local video_dir="$2"
   local trial_number=0
   local video_path=""
-  local success_path=""
-  local failure_path=""
+  local video_stem=""
+  local outcome_videos=()
 
   for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
     if ((10#${NUM_TRIALS} == 1)); then
@@ -560,15 +531,18 @@ validate_video_outputs() {
       printf -v video_path '%s/%s_rollout_trial_%03d.mp4' "${video_dir}" "${task_id}" "${trial_number}"
     fi
     if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
-      success_path="${video_path%.mp4}_success.mp4"
-      failure_path="${video_path%.mp4}_failure.mp4"
-      if [[ -s "${success_path}" && ! -e "${failure_path}" ]]; then
-        continue
-      fi
-      if [[ -s "${failure_path}" && ! -e "${success_path}" ]]; then
-        continue
-      fi
-      return 1
+      video_stem="${video_path%.mp4}"
+      shopt -s nullglob
+      outcome_videos=(
+        "${video_stem}"_[s]uccess.mp4
+        "${video_stem}"_[f]ailure.mp4
+        "${video_stem}"_retry_[0-9][0-9][0-9]_[s]uccess.mp4
+        "${video_stem}"_retry_[0-9][0-9][0-9]_[f]ailure.mp4
+      )
+      shopt -u nullglob
+      ((${#outcome_videos[@]} == 1)) || return 1
+      [[ -s "${outcome_videos[0]}" ]] || return 1
+      continue
     fi
     [[ -s "${video_path}" ]] || return 1
   done
@@ -595,7 +569,6 @@ append_task_result() {
     printf 'video_dir=%s\n' "${video_dir}"
     printf 'video_count=%s\n' "${video_count}"
     printf 'reason=%s\n' "${reason}"
-    printf 'raw_summary=%s\n' "${LAST_RAW_SUMMARY:-N/A}"
   } >>"${SUMMARY_FILE}"
 }
 
@@ -614,10 +587,9 @@ run_task() {
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
   mkdir -p "${video_dir}" || return 1
   build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
-  log "starting task=${task_id} trials=${NUM_TRIALS} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
   log "server_log=${server_log}"
   log "client_log=${client_log}"
 
@@ -703,8 +675,9 @@ append_overall_summary() {
 validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  log "ood_lighting=${OOD_LIGHTING}"
   log "validated configuration; no process or result directory will be created"
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} max_steps=benchmark_config clock_mode=${CLOCK_MODE} action_alignment=${SMOLVLA_ACTION_ALIGNMENT} physics_device=${MOTIONFORGE_DEVICE} send_horizon=${SMOLVLA_SEND_HORIZON} execution_horizon=${SMOLVLA_EXECUTION_HORIZON} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "model=${SMOLVLA_MODEL_PATH} result_dir=${RESULT_DIR}"
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
@@ -723,27 +696,24 @@ if [[ -e "${RESULT_DIR}" ]]; then
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'SmolVLA CM000-CM010 MotionForge evaluation\n'
+  printf 'SmolVLA CM000-CM009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${SMOLVLA_MODEL_PATH}"
   printf 'device=%s\n' "${SMOLVLA_DEVICE}"
   printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
   printf 'cuda_visible_devices=%s\n' "${SMOLVLA_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'hf_home=%s\n' "${SMOLVLA_HF_HOME}"
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
   printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
+  printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
   printf 'max_steps_source=benchmark_config\n'
-  printf 'clock_mode=%s\n' "${CLOCK_MODE}"
-  printf 'action_alignment=%s\n' "${SMOLVLA_ACTION_ALIGNMENT}"
+  printf 'timing_source=benchmark_config\n'
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
   printf 'initial_position_mode=fixed\n'
-  printf 'action_hz=%s\n' "${SMOLVLA_ACTION_HZ}"
-  printf 'max_inference_hz=%s\n' "${SMOLVLA_MAX_INFERENCE_HZ}"
   printf 'action_horizon=50\n'
-  printf 'send_horizon=%s\n' "${SMOLVLA_SEND_HORIZON}"
-  printf 'execution_horizon=%s\n' "${SMOLVLA_EXECUTION_HORIZON}"
   printf 'video_enabled=true\n'
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"

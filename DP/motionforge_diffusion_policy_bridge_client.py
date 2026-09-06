@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import random
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -15,9 +18,19 @@ from typing import Any
 import numpy as np
 import torch
 
+_motionforge_root = Path(
+    os.environ.get(
+        "MOTIONFORGE_ROOT",
+        Path(__file__).resolve().parents[2] / "MotionForge",
+    )
+)
+_motionforge_source = str(_motionforge_root / "source" / "motionforge")
+if _motionforge_source not in sys.path:
+    sys.path.insert(0, _motionforge_source)
 
-PROTOCOL_VERSION = "motionforge.benchmark.v1"
-ACTION_KEY = "eef_xyz_rot6d_gripper"
+from motionforge.benchmark.client import BenchmarkClientBridge, ClientBridgeConfig
+from motionforge.benchmark.protocol import ObservationRequest, ResetMessage
+
 IMAGE_NATIVE_HWC_SHAPES = {
     "observation.images.overview": (240, 320, 3),
     "observation.images.front": (240, 320, 3),
@@ -50,59 +63,39 @@ EXPECTED_IMAGE_TRANSFORMS_BY_DATASET = {
             }
         },
     },
+    "local/lerobot_ht": {
+        "enable": True,
+        "max_num_transforms": 1,
+        "random_order": False,
+        "tfs": {
+            "resize": {
+                "weight": 1.0,
+                "type": "Resize",
+                "kwargs": {"size": [240, 320]},
+            }
+        },
+    },
+    "local/lerobot_hri": {
+        "enable": True,
+        "max_num_transforms": 1,
+        "random_order": False,
+        "tfs": {
+            "resize": {
+                "weight": 1.0,
+                "type": "Resize",
+                "kwargs": {"size": [240, 320]},
+            }
+        },
+    },
 }
 
 
-@dataclass(slots=True)
-class MotionForgeTransport:
-    """Minimal ZMQ transport for MotionForge benchmark packets."""
-
-    host: str
-    obs_port: int
-    act_port: int
-    recv_timeout_ms: int
-    send_timeout_ms: int
-
-    _zmq: Any = field(init=False)
-    _context: Any = field(init=False)
-    _obs_socket: Any = field(init=False)
-    _act_socket: Any = field(init=False)
-
-    def __post_init__(self) -> None:
-        import zmq
-
-        self._zmq = zmq
-        self._context = zmq.Context()
-        self._obs_socket = self._context.socket(zmq.SUB)
-        self._obs_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self._obs_socket.setsockopt(zmq.RCVHWM, 16)
-        self._obs_socket.connect(f"tcp://{self.host}:{self.obs_port}")
-
-        self._act_socket = self._context.socket(zmq.PUSH)
-        self._act_socket.setsockopt(zmq.SNDHWM, 16)
-        self._act_socket.setsockopt(zmq.SNDTIMEO, self.send_timeout_ms)
-        self._act_socket.connect(f"tcp://{self.host}:{self.act_port}")
-
-    def receive(self) -> dict[str, Any] | None:
-        if self._obs_socket.poll(timeout=self.recv_timeout_ms) == 0:
-            return None
-        message = self._obs_socket.recv_pyobj()
-        if not isinstance(message, dict):
-            raise TypeError(f"Expected a dict packet, got {type(message).__name__}.")
-        return message
-
-    def send(self, packet: dict[str, Any]) -> None:
-        try:
-            self._act_socket.send_pyobj(packet)
-        except self._zmq.Again as exc:
-            raise TimeoutError(
-                f"Timed out sending an action to tcp://{self.host}:{self.act_port}."
-            ) from exc
-
-    def close(self) -> None:
-        self._obs_socket.close(linger=0)
-        self._act_socket.close(linger=0)
-        self._context.term()
+def seed_policy_rng(seed: int) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed) % 2**32)
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
 
 @dataclass(slots=True)
@@ -111,7 +104,6 @@ class DiffusionPolicyInference:
 
     checkpoint: Path
     device: str
-    policy_seed: int
     num_inference_steps: int | None = None
 
     config: Any = field(init=False)
@@ -121,7 +113,7 @@ class DiffusionPolicyInference:
     image_transform: Any = field(init=False)
     observation_history: deque[dict[str, torch.Tensor]] = field(init=False)
     noise_generator: torch.Generator = field(init=False)
-    episode_index: int = field(init=False, default=0)
+    _current_policy_seed: int = field(init=False, default=0)
 
     def __post_init__(self) -> None:
         self.checkpoint = self.checkpoint.expanduser().resolve()
@@ -166,7 +158,7 @@ class DiffusionPolicyInference:
         parameter = next(self.policy.parameters())
         self.noise_generator = torch.Generator(device=parameter.device)
         self.observation_history = deque(maxlen=int(self.config.n_obs_steps))
-        self.reset()
+        self._reset_state(seed=0)
 
     @property
     def action_horizon(self) -> int:
@@ -182,16 +174,22 @@ class DiffusionPolicyInference:
 
     @property
     def current_policy_seed(self) -> int:
-        return (int(self.policy_seed) + int(self.episode_index)) % (2**63 - 1)
+        return int(self._current_policy_seed)
 
-    def reset(self, *, advance_episode: bool = False) -> None:
-        if advance_episode:
-            self.episode_index += 1
+    def _reset_state(self, *, seed: int) -> None:
+        if not 0 <= int(seed) < 2**63 - 1:
+            raise ValueError(f"RESET seed must be in [0, 2**63 - 2], got {seed}.")
+        self._current_policy_seed = int(seed)
+        seed_policy_rng(self.current_policy_seed)
         self.policy.reset()
         self.preprocessor.reset()
         self.postprocessor.reset()
         self.observation_history.clear()
         self.noise_generator.manual_seed(self.current_policy_seed)
+
+    def reset(self, reset: ResetMessage) -> None:
+        """Reset policy history and RNG exactly to the server-provided episode seed."""
+        self._reset_state(seed=int(reset.seed))
 
     def predict_chunk(self, message: dict[str, Any]) -> np.ndarray:
         observation = build_diffusion_observation(
@@ -226,6 +224,9 @@ class DiffusionPolicyInference:
             raise ValueError("Diffusion Policy produced non-finite actions.")
         return array
 
+    def predict(self, observation: ObservationRequest) -> np.ndarray:
+        return self.predict_chunk(observation.to_dict())
+
     def _append_and_stack_observation(
         self, processed_observation: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
@@ -258,7 +259,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--policy-seed", type=int, default=0)
     parser.add_argument(
         "--num-inference-steps",
         type=int,
@@ -272,22 +272,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motionforge-obs-port", type=int, default=3196)
     parser.add_argument("--motionforge-act-port", type=int, default=3198)
     parser.add_argument("--num-episodes", type=int, default=1)
-    parser.add_argument("--action-hz", type=float, default=30.0)
-    parser.add_argument("--max-inference-hz", type=float, default=30.0)
-    parser.add_argument(
-        "--send-horizon",
-        type=int,
-        default=16,
-        help="Number of leading Diffusion Policy actions sent to MotionForge; GR00T FC sends 16.",
-    )
-    parser.add_argument(
-        "--execution-horizon",
-        type=int,
-        default=8,
-        help="Execution horizon advertised in packet metadata; GR00T FC uses 8.",
-    )
-    parser.add_argument("--recv-timeout-ms", type=int, default=100)
-    parser.add_argument("--send-timeout-ms", type=int, default=10000)
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument(
         "--validate-checkpoint",
@@ -301,20 +285,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--motionforge-act-port must be in [1, 65535]")
     if args.motionforge_obs_port == args.motionforge_act_port:
         parser.error("observation and action ports must differ")
-    if not 0 <= args.policy_seed < 2**63 - 1:
-        parser.error("--policy-seed must be in [0, 2**63 - 2]")
     if args.num_inference_steps is not None and not 1 <= args.num_inference_steps <= 100:
         parser.error("--num-inference-steps must be in [1, 100]")
-    if args.num_episodes < 0:
-        parser.error("--num-episodes must be >= 0")
-    if args.action_hz <= 0 or args.max_inference_hz <= 0:
-        parser.error("action and inference frequencies must be positive")
-    if args.send_horizon < 1:
-        parser.error("--send-horizon must be >= 1")
-    if not 1 <= args.execution_horizon <= args.send_horizon:
-        parser.error("--execution-horizon must be in [1, --send-horizon]")
-    if args.recv_timeout_ms < 1 or args.send_timeout_ms < 1:
-        parser.error("transport timeouts must be positive")
+    if args.num_episodes < 1:
+        parser.error("--num-episodes must be >= 1")
     if args.print_every < 0:
         parser.error("--print-every must be >= 0")
     return args
@@ -478,7 +452,6 @@ def build_diffusion_observation(
     input_features: dict[str, Any],
     image_transform: Any,
 ) -> dict[str, torch.Tensor]:
-    require_protocol(message)
     expected_keys = {STATE_KEY, *IMAGE_KEYS}
     if set(input_features) != expected_keys:
         raise ValueError(
@@ -551,65 +524,6 @@ def require_field(message: dict[str, Any], key: str) -> Any:
     return message[key]
 
 
-def require_protocol(message: dict[str, Any]) -> None:
-    protocol = message.get("protocol_version")
-    if protocol != PROTOCOL_VERSION:
-        raise ValueError(
-            f"Unsupported MotionForge protocol {protocol!r}; expected {PROTOCOL_VERSION!r}."
-        )
-
-
-def action_packet(
-    *,
-    actions: np.ndarray,
-    message: dict[str, Any],
-    action_horizon: int,
-    execution_horizon: int,
-    inference_duration_s: float,
-    action_hz: float,
-    max_inference_hz: float,
-    observation_horizon: int,
-    diffusion_horizon: int,
-    num_inference_steps: int,
-    policy_seed: int,
-) -> dict[str, Any]:
-    send_horizon = int(actions.shape[0])
-    if not 1 <= execution_horizon <= send_horizon <= action_horizon:
-        raise ValueError(
-            "Expected 1 <= execution_horizon <= send_horizon <= action_horizon, got "
-            f"{execution_horizon}, {send_horizon}, and {action_horizon}."
-        )
-    observation_index = int(require_field(message, "index"))
-    packet: dict[str, Any] = {
-        "protocol_version": PROTOCOL_VERSION,
-        # Built-in lists keep the wire payload compatible across NumPy major versions.
-        "action": actions.tolist(),
-        "action_key": ACTION_KEY,
-        "action_frame": "robot",
-        "action_representation": "ABSOLUTE",
-        "observation_index": observation_index,
-        "action_hz": float(action_hz),
-        "action_alignment": "observation_aligned",
-        "inference_duration_s": float(inference_duration_s),
-        "max_inference_hz": float(max_inference_hz),
-        "created_time": time.time(),
-        "metadata": {
-            "client": "motionforge_diffusion_policy_bridge",
-            "action_horizon": int(action_horizon),
-            "send_horizon": send_horizon,
-            "execution_horizon": int(execution_horizon),
-            "observation_horizon": int(observation_horizon),
-            "diffusion_horizon": int(diffusion_horizon),
-            "num_inference_steps": int(num_inference_steps),
-            "policy_seed": int(policy_seed),
-            "request_kind": message.get("request_kind"),
-        },
-    }
-    if message.get("request_id") is not None:
-        packet["request_id"] = int(message["request_id"])
-    return packet
-
-
 def installed_lerobot_version() -> str:
     try:
         return version("lerobot")
@@ -619,10 +533,6 @@ def installed_lerobot_version() -> str:
 
 def synthetic_message() -> dict[str, Any]:
     return {
-        "protocol_version": PROTOCOL_VERSION,
-        "index": 0,
-        "request_id": 0,
-        "request_kind": "validation",
         STATE_KEY: np.zeros((10,), dtype=np.float32),
         **{
             key: np.zeros(shape, dtype=np.uint8)
@@ -651,126 +561,45 @@ def main() -> int:
     inference = DiffusionPolicyInference(
         checkpoint=args.model_path,
         device=args.device,
-        policy_seed=args.policy_seed,
         num_inference_steps=args.num_inference_steps,
     )
-    if args.send_horizon > inference.action_horizon:
-        raise ValueError(
-            f"--send-horizon={args.send_horizon} exceeds checkpoint action horizon "
-            f"{inference.action_horizon}."
-        )
     print(
         "[MOTIONFORGE-DIFFUSION] loaded "
         f"checkpoint={inference.checkpoint} device={args.device} "
         f"lerobot={current_version} observation_horizon={inference.observation_horizon} "
         f"diffusion_horizon={inference.diffusion_horizon} "
         f"num_inference_steps={inference.num_inference_steps} "
-        f"action_horizon={inference.action_horizon} send_horizon={args.send_horizon} "
-        f"execution_horizon={args.execution_horizon} policy_seed={args.policy_seed}",
+        f"action_horizon={inference.action_horizon} wire_horizon=server_required_16 "
+        "policy_seed=server_reset",
         flush=True,
     )
     if args.validate_checkpoint:
         return run_validation(inference)
 
-    transport = MotionForgeTransport(
-        host=args.motionforge_host,
-        obs_port=args.motionforge_obs_port,
-        act_port=args.motionforge_act_port,
-        recv_timeout_ms=args.recv_timeout_ms,
-        send_timeout_ms=args.send_timeout_ms,
-    )
-    episodes = 0
-    observations = 0
-    actions_sent = 0
-    episode_observations = 0
-    processed_request_ids: set[int] = set()
     print(
         "[MOTIONFORGE-DIFFUSION] listening "
         f"host={args.motionforge_host} obs_port={args.motionforge_obs_port} "
         f"act_port={args.motionforge_act_port}",
         flush=True,
     )
+    bridge = BenchmarkClientBridge(
+        policy=inference,
+        config=ClientBridgeConfig(
+            host=args.motionforge_host,
+            obs_port=int(args.motionforge_obs_port),
+            act_port=int(args.motionforge_act_port),
+            num_episodes=int(args.num_episodes),
+            print_every=int(args.print_every),
+        ),
+        log=lambda message: print(f"[MOTIONFORGE-DIFFUSION] {message}", flush=True),
+    )
     try:
-        while True:
-            message = transport.receive()
-            if message is None:
-                continue
-            if "episode_result" in message:
-                episodes += 1
-                print(
-                    "[MOTIONFORGE-DIFFUSION] episode_result "
-                    f"episode={episodes} observations={episode_observations} "
-                    f"result={message['episode_result']}",
-                    flush=True,
-                )
-                inference.reset(advance_episode=True)
-                processed_request_ids.clear()
-                episode_observations = 0
-                if args.num_episodes and episodes >= args.num_episodes:
-                    break
-                continue
-
-            require_protocol(message)
-            request_id_value = message.get("request_id")
-            request_id = None if request_id_value is None else int(request_id_value)
-            if request_id is not None and request_id in processed_request_ids:
-                print(
-                    f"[MOTIONFORGE-DIFFUSION] duplicate_request request_id={request_id}",
-                    flush=True,
-                )
-                continue
-            is_warmup = message.get("request_kind") == "warmup"
-            if is_warmup:
-                inference.reset()
-                processed_request_ids.clear()
-
-            observations += 1
-            episode_observations += 1
-            started_at = time.perf_counter()
-            predicted_actions = inference.predict_chunk(message)
-            inference_duration_s = time.perf_counter() - started_at
-            actions = np.ascontiguousarray(predicted_actions[: args.send_horizon])
-            packet = action_packet(
-                actions=actions,
-                message=message,
-                action_horizon=inference.action_horizon,
-                execution_horizon=args.execution_horizon,
-                inference_duration_s=inference_duration_s,
-                action_hz=args.action_hz,
-                max_inference_hz=args.max_inference_hz,
-                observation_horizon=inference.observation_horizon,
-                diffusion_horizon=inference.diffusion_horizon,
-                num_inference_steps=int(inference.num_inference_steps),
-                policy_seed=inference.current_policy_seed,
-            )
-            transport.send(packet)
-            actions_sent += 1
-            if request_id is not None:
-                processed_request_ids.add(request_id)
-            if is_warmup:
-                # Warmup output is discarded by the server; reset history and RNG so
-                # the first real plan starts from duplicated current observations.
-                inference.reset()
-            if args.print_every and (actions_sent == 1 or actions_sent % args.print_every == 0):
-                print(
-                    "[MOTIONFORGE-DIFFUSION] action_sent "
-                    f"count={actions_sent} request_id={request_id} "
-                    f"observation_index={packet['observation_index']} "
-                    f"predicted_shape={predicted_actions.shape} sent_shape={actions.shape} "
-                    f"inference_s={inference_duration_s:.3f}",
-                    flush=True,
-                )
+        bridge.run()
     except KeyboardInterrupt:
         print("[MOTIONFORGE-DIFFUSION] interrupted", flush=True)
         return 130
-    finally:
-        transport.close()
 
-    print(
-        "[MOTIONFORGE-DIFFUSION] done "
-        f"episodes={episodes} observations={observations} actions_sent={actions_sent}",
-        flush=True,
-    )
+    print(f"[MOTIONFORGE-DIFFUSION] done episodes={args.num_episodes}", flush=True)
     return 0
 
 

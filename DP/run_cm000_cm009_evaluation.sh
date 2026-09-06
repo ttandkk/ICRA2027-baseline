@@ -5,21 +5,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
+BRIDGE_PYTHONPATH="${MOTIONFORGE_ROOT}/source/motionforge:${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 BRIDGE_CLIENT="${SCRIPT_DIR}/motionforge_diffusion_policy_bridge_client.py"
 TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
-BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/factory_conveyor"
+BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion"
+RUNTIME_ASSET_DIR="${MOTIONFORGE_ROOT}/source/motionforge/motionforge/assets/runtime"
 
-DIFFUSION_MODEL_PATH="${DIFFUSION_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/DiffusionPolicy/FC-80000-3views}"
+DIFFUSION_MODEL_PATH="${DIFFUSION_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/DiffusionPolicy/CM-80000-3views}"
 DIFFUSION_PYTHON="${DIFFUSION_PYTHON:-${WORKSPACE_ROOT}/miniconda3/envs/lerobot/bin/python}"
 DIFFUSION_DEVICE="${DIFFUSION_DEVICE:-cuda:0}"
-DIFFUSION_NUM_INFERENCE_STEPS="${DIFFUSION_NUM_INFERENCE_STEPS:-40}"
+DIFFUSION_NUM_INFERENCE_STEPS="${DIFFUSION_NUM_INFERENCE_STEPS:-20}"
 DIFFUSION_PRINT_EVERY="${DIFFUSION_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
-# Keep physics on CPU while AppLauncher renders on the selected visible GPU.
+# CM compound containers and articulated payloads require CPU PhysX. Rendering
+# and Diffusion Policy inference still use the selected visible GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
-DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES="${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
+DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES="${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-3}}"
 MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
@@ -27,37 +30,34 @@ TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 START_SEED="${DIFFUSION_EVAL_START_SEED:-0}"
 NUM_TRIALS="${DIFFUSION_EVAL_NUM_TRIALS:-50}"
 ATTEMPTS_PER_WORKER="${MOTIONFORGE_ATTEMPTS_PER_WORKER:-50}"
-# Keep an explicit override available, but use each benchmark YAML by default.
-MAX_STEPS="${DIFFUSION_EVAL_MAX_STEPS:-1400}"
-USE_BENCHMARK_MAX_STEPS="${DIFFUSION_EVAL_USE_BENCHMARK_MAX_STEPS:-1}"
-MOTION_LEVEL="${DIFFUSION_EVAL_MOTION_LEVEL:-}"
-INITIAL_POSITION_MODE="${DIFFUSION_EVAL_INITIAL_POSITION_MODE:-fixed}"
-OBS_PORT="${DIFFUSION_EVAL_OBS_PORT:-3196}"
-ACT_PORT="${DIFFUSION_EVAL_ACT_PORT:-3198}"
+OBS_PORT="${DIFFUSION_EVAL_OBS_PORT:-3396}"
+DIFFUSION_PORT="${DIFFUSION_EVAL_DIFFUSION_PORT:-3398}"
 TASK_TIMEOUT_S="${DIFFUSION_EVAL_TASK_TIMEOUT_S:-14400}"
 BETWEEN_TASKS_S="${DIFFUSION_EVAL_BETWEEN_TASKS_S:-5}"
 
 VIDEO_WIDTH="${DIFFUSION_EVAL_VIDEO_WIDTH:-640}"
 VIDEO_HEIGHT="${DIFFUSION_EVAL_VIDEO_HEIGHT:-480}"
 VIDEO_STRIDE="${DIFFUSION_EVAL_VIDEO_STRIDE:-1}"
+VIDEO_OUTCOME_SUFFIX="${DIFFUSION_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/output"
-RUN_ID="${DIFFUSION_EVAL_RUN_ID:-diffusion_policy_fc000_fc009_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${DIFFUSION_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output/circular_motion/cm000_cm009/level2_fixed/server_scheduled}"
+RUN_ID="${DIFFUSION_EVAL_RUN_ID:-diffusion_policy_cm000_cm009_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
+OOD_LIGHTING="${DIFFUSION_EVAL_OOD_LIGHTING-0}"
 
 DEFAULT_TASK_IDS=(
-  fc_000
-  fc_001
-  fc_002
-  fc_003
-  fc_004
-  fc_005
-  fc_006
-  fc_007
-  fc_008
-  fc_009
+  cm_000
+  cm_001
+  cm_002
+  cm_003
+  cm_004
+  cm_005
+  cm_006
+  cm_007
+  cm_008
+  cm_009
 )
 
 if [[ -n "${DIFFUSION_EVAL_TASKS:-}" ]]; then
@@ -77,11 +77,11 @@ LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
 
 log() {
-  printf '[DIFFUSION-FC000-FC009-EVAL] %s\n' "$*"
+  printf '[DIFFUSION-CM000-CM009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[DIFFUSION-FC000-FC009-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[DIFFUSION-CM000-CM009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -109,6 +109,14 @@ require_uint_at_least() {
   fi
 }
 
+benchmark_max_steps() {
+  local benchmark_config="$1"
+  local configured=""
+  configured="$(awk '/^[[:space:]]*max_steps:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "${benchmark_config}")"
+  [[ -n "${configured}" ]] || die "runtime.max_steps not found in benchmark: ${benchmark_config}"
+  printf '%s\n' "${configured}"
+}
+
 validate_checkpoint() {
   require_dir "${DIFFUSION_MODEL_PATH}"
   require_file "${DIFFUSION_MODEL_PATH}/config.json"
@@ -119,71 +127,27 @@ validate_checkpoint() {
   require_file "${DIFFUSION_MODEL_PATH}/policy_preprocessor_step_3_normalizer_processor.safetensors"
   require_file "${DIFFUSION_MODEL_PATH}/policy_postprocessor_step_0_unnormalizer_processor.safetensors"
 
-  PYTHONDONTWRITEBYTECODE=1 "${DIFFUSION_PYTHON}" -c '
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${BRIDGE_PYTHONPATH}" \
+    "${DIFFUSION_PYTHON}" -c '
 import json
 import sys
 from pathlib import Path
 
-from safetensors import safe_open
+sys.path.insert(0, sys.argv[2])
+import motionforge_diffusion_policy_bridge_client as client
 
 checkpoint = Path(sys.argv[1])
-config = json.loads((checkpoint / "config.json").read_text())
-train_config = json.loads((checkpoint / "train_config.json").read_text())
-preprocessor = json.loads((checkpoint / "policy_preprocessor.json").read_text())
-expected_inputs = {
-    "observation.state": [10],
-    "observation.images.overview": [3, 240, 320],
-    "observation.images.front": [3, 240, 320],
-    "observation.images.wrist": [3, 240, 320],
-}
-expected_image_transforms = {
-    "enable": True,
-    "max_num_transforms": 1,
-    "random_order": False,
-    "tfs": {
-        "resize": {
-            "weight": 1.0,
-            "type": "Resize",
-            "kwargs": {"size": [240, 320], "antialias": True},
-        }
-    },
-}
-assert config.get("type") == "diffusion", config.get("type")
-assert train_config.get("policy") == config
-assert train_config.get("dataset", {}).get("image_transforms") == expected_image_transforms
-assert config.get("n_obs_steps") == 2, config.get("n_obs_steps")
-assert config.get("horizon") == 64, config.get("horizon")
-assert config.get("n_action_steps") == 32, config.get("n_action_steps")
-assert config.get("num_train_timesteps") == 100, config.get("num_train_timesteps")
-assert config.get("num_inference_steps") is None, config.get("num_inference_steps")
-assert config.get("noise_scheduler_type") == "DDPM", config.get("noise_scheduler_type")
-assert config.get("use_separate_rgb_encoder_per_camera") is True
-assert config.get("resize_shape") is None
-assert config.get("crop_shape") is None
-assert config.get("output_features", {}).get("action", {}).get("shape") == [10]
-assert set(config.get("input_features", {})) == set(expected_inputs)
-for key, shape in expected_inputs.items():
-    assert config.get("input_features", {}).get(key, {}).get("shape") == shape, key
-steps = preprocessor.get("steps", [])
-assert [step.get("registry_name") for step in steps] == [
-    "rename_observations_processor",
-    "to_batch_processor",
-    "device_processor",
-    "normalizer_processor",
-]
-assert steps[0].get("config", {}).get("rename_map") == {}
-stats_path = checkpoint / "policy_preprocessor_step_3_normalizer_processor.safetensors"
-with safe_open(stats_path, framework="pt", device="cpu") as stats:
-    assert tuple(stats.get_tensor("observation.state.min").shape) == (10,)
-    assert tuple(stats.get_tensor("action.min").shape) == (10,)
-    assert tuple(stats.get_tensor("observation.images.overview.mean").shape) == (3, 1, 1)
-    assert tuple(stats.get_tensor("observation.images.front.mean").shape) == (3, 1, 1)
-    assert tuple(stats.get_tensor("observation.images.wrist.mean").shape) == (3, 1, 1)
-' "${DIFFUSION_MODEL_PATH}" || die "checkpoint does not match the trained three-view DiffusionPolicy-FC contract"
+client.validate_checkpoint_files(checkpoint)
+config = client.load_diffusion_config(checkpoint, "cpu")
+client.validate_diffusion_contract(checkpoint, config)
+train_config = json.loads((checkpoint / "train_config.json").read_text(encoding="utf-8"))
+assert train_config.get("dataset", {}).get("repo_id") == "local/pi05_merged_v30"
+' "${DIFFUSION_MODEL_PATH}" "${SCRIPT_DIR}" \
+    || die "checkpoint does not match the trained three-view DiffusionPolicy-CM contract"
 }
 
 validate_runtime_imports() {
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${BRIDGE_PYTHONPATH}" \
     "${DIFFUSION_PYTHON}" -c '
 import diffusers
 import zmq
@@ -194,14 +158,59 @@ from lerobot.transforms.transforms import ImageTransforms, ImageTransformsConfig
 ' || die "Diffusion Policy runtime imports failed; verify LeRobot, diffusers, and pyzmq"
 }
 
+validate_bridge_contract() {
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${BRIDGE_PYTHONPATH}" \
+    "${DIFFUSION_PYTHON}" -c '
+import sys
+import inspect
+
+sys.path.insert(0, sys.argv[1])
+import motionforge_diffusion_policy_bridge_client as client
+from motionforge.benchmark.client import BenchmarkClientBridge
+from motionforge.benchmark.protocol import PROTOCOL
+
+assert PROTOCOL == "motionforge.server_scheduled"
+assert list(inspect.signature(client.DiffusionPolicyInference.reset).parameters) == [
+    "self",
+    "reset",
+]
+assert list(inspect.signature(client.DiffusionPolicyInference.predict).parameters) == [
+    "self",
+    "observation",
+]
+assert not hasattr(client, "MotionForgeTransport")
+assert not hasattr(client, "action_packet")
+assert BenchmarkClientBridge is not None
+' "${SCRIPT_DIR}" || die "Diffusion Policy bridge does not match the CM server-scheduled contract"
+}
+
+validate_runtime_assets() {
+  require_file "${RUNTIME_ASSET_DIR}/environments/circular_motion/kitchen_rotary_room_01/derived/kitchen_rotary_room_01_visual.usda"
+  require_file "${RUNTIME_ASSET_DIR}/furniture/kitchen_islands/geniesim_table_03/derived/kitchen_island_table_03_visual.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/xuanyu/turntables/turntable_visual_smoked_glass_steel_v1/derived/turntable_visual_smoked_glass_steel_v1.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/mug_trees/kelcode_modular_mug_tree_01/derived/mug_tree_4_hook_articulation.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_rotating_test_tube_rack_opaque_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_test_tube_18x105_opaque_blue_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_test_tube_18x105_opaque_yellow_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/control_panels/rotating_three_button_panel_01/derived/rotating_three_button_panel_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/containers/baskets/wicker_basket_01/wicker_basket_01_rigid.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/puzzles/rubik_cube_01/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/fruit_snack_package/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/medicine_bottle/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/classic_blue_mug/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/polyhaven/rubber_duck/derived/graspable.usda"
+}
+
 validate_configuration() {
   local task_id=""
   local benchmark_config=""
+  local task_max_steps=""
 
   require_dir "${MOTIONFORGE_ROOT}"
   require_dir "${LEROBOT_ROOT}/src/lerobot"
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
+  require_dir "${BENCHMARK_DIR}"
   require_executable "${DIFFUSION_PYTHON}"
   if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
     require_executable "${MOTIONFORGE_PYTHON}"
@@ -213,20 +222,25 @@ validate_configuration() {
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
   validate_checkpoint
   validate_runtime_imports
+  validate_bridge_contract
+  validate_runtime_assets
 
+  [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die \
+    "MOTIONFORGE_DEVICE must be cpu for CM evaluation; GPU PhysX makes rotating compound/articulated payloads sink"
   ((${#TASK_IDS[@]} > 0)) || die "DIFFUSION_EVAL_TASKS must select at least one task"
   for task_id in "${TASK_IDS[@]}"; do
-    [[ "${task_id}" =~ ^fc_00[0-9]$ ]] || die "invalid FC task id: ${task_id}"
+    [[ "${task_id}" =~ ^cm_(00[0-9]|010)$ ]] || die "invalid CM task id: ${task_id}"
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
     require_file "${benchmark_config}"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
+    require_uint_at_least "${task_id} max_steps" "${task_max_steps}" 1
   done
 
   require_uint_at_least "DIFFUSION_EVAL_START_SEED" "${START_SEED}" 0
   require_uint_at_least "DIFFUSION_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
   require_uint_at_least "MOTIONFORGE_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
-  require_uint_at_least "DIFFUSION_EVAL_MAX_STEPS" "${MAX_STEPS}" 1
   require_uint_at_least "DIFFUSION_EVAL_OBS_PORT" "${OBS_PORT}" 1
-  require_uint_at_least "DIFFUSION_EVAL_ACT_PORT" "${ACT_PORT}" 1
+  require_uint_at_least "DIFFUSION_EVAL_DIFFUSION_PORT" "${DIFFUSION_PORT}" 1
   require_uint_at_least "DIFFUSION_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
   require_uint_at_least "DIFFUSION_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
   require_uint_at_least "DIFFUSION_NUM_INFERENCE_STEPS" "${DIFFUSION_NUM_INFERENCE_STEPS}" 1
@@ -235,19 +249,21 @@ validate_configuration() {
   require_uint_at_least "DIFFUSION_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
   require_uint_at_least "DIFFUSION_EVAL_VIDEO_STRIDE" "${VIDEO_STRIDE}" 1
   ((10#${DIFFUSION_NUM_INFERENCE_STEPS} <= 100)) \
-    || die "DIFFUSION_NUM_INFERENCE_STEPS must be <= the checkpoint training timestep count 100"
+    || die "DIFFUSION_NUM_INFERENCE_STEPS must be <= 100"
   ((10#${OBS_PORT} <= 65535)) || die "DIFFUSION_EVAL_OBS_PORT must be <= 65535"
-  ((10#${ACT_PORT} <= 65535)) || die "DIFFUSION_EVAL_ACT_PORT must be <= 65535"
-  [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
+  ((10#${DIFFUSION_PORT} <= 65535)) || die "DIFFUSION_EVAL_DIFFUSION_PORT must be <= 65535"
+  [[ "${OBS_PORT}" != "${DIFFUSION_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
-  [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" || "${USE_BENCHMARK_MAX_STEPS}" == "1" ]] \
-    || die "DIFFUSION_EVAL_USE_BENCHMARK_MAX_STEPS must be 0 or 1"
-  [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
-    || die "DIFFUSION_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
-  [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
-    || die "DIFFUSION_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
-  [[ -n "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}" ]] \
-    || die "DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
+  [[ "${OOD_LIGHTING}" == "0" || "${OOD_LIGHTING}" == "1" ]] \
+    || die "DIFFUSION_EVAL_OOD_LIGHTING must be 0 or 1"
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "lighting OOD requires all trial seeds to be in 0-49"
+  fi
+  [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
+    || die "DIFFUSION_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
+  require_uint_at_least \
+    "DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES" "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}" 0
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] \
     || die "DIFFUSION_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -275,8 +291,9 @@ trap 'exit 143' TERM
 
 build_commands() {
   local benchmark_config="$1"
-  local video_dir="$2"
-  local video_name="$3"
+  local task_max_steps="$2"
+  local video_dir="$3"
+  local video_name="$4"
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}"
@@ -306,19 +323,20 @@ build_commands() {
     "${NUM_TRIALS}"
     --attempts_per_worker
     "${ATTEMPTS_PER_WORKER}"
+    --max_steps
+    "${task_max_steps}"
     --initial_position_mode
-    "${INITIAL_POSITION_MODE}"
+    fixed
     --device
     "${MOTIONFORGE_DEVICE}"
     --obs_port
     "${OBS_PORT}"
     --act_port
-    "${ACT_PORT}"
+    "${DIFFUSION_PORT}"
     --video_dir
     "${video_dir}"
     --video_name
     "${video_name}"
-    --video_outcome_suffix
     --video_width
     "${VIDEO_WIDTH}"
     --video_height
@@ -326,12 +344,11 @@ build_commands() {
     --video_stride
     "${VIDEO_STRIDE}"
   )
-
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" ]]; then
-    SERVER_COMMAND+=(--max_steps "${MAX_STEPS}")
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_lighting)
   fi
-  if [[ -n "${MOTION_LEVEL}" ]]; then
-    SERVER_COMMAND+=(--motion_level "${MOTION_LEVEL}")
+  if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+    SERVER_COMMAND+=(--video_outcome_suffix)
   fi
 
   BRIDGE_COMMAND=(
@@ -350,7 +367,7 @@ build_commands() {
     --motionforge-obs-port
     "${OBS_PORT}"
     --motionforge-act-port
-    "${ACT_PORT}"
+    "${DIFFUSION_PORT}"
     --num-episodes
     "${NUM_TRIALS}"
     --print-every
@@ -367,8 +384,8 @@ print_command() {
 }
 
 print_bridge_command() {
-  printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=%q ' \
-    "${LEROBOT_ROOT}" "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}" "${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+  printf '  (cd %q && CUDA_VISIBLE_DEVICES=%q PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONPATH=%q ' \
+    "${LEROBOT_ROOT}" "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}" "${BRIDGE_PYTHONPATH}"
   printf '%q ' "${BRIDGE_COMMAND[@]}"
   printf ')\n'
 }
@@ -430,6 +447,7 @@ parse_task_summary() {
   LAST_SUCCESS_RATE="${BASH_REMATCH[4]}"
   ((10#${LAST_TRIALS} == 10#${NUM_TRIALS})) || return 1
   ((10#${LAST_SUCCESSES} + 10#${LAST_FAILURES} == 10#${LAST_TRIALS})) || return 1
+  return 0
 }
 
 count_videos() {
@@ -445,32 +463,28 @@ validate_video_outputs() {
   local task_id="$1"
   local video_dir="$2"
   local trial_number=0
-  local video_stem=""
-  local candidate_path=""
-  local retry_paths=()
-  local scored_paths=()
+  local video_path=""
+  local success_path=""
+  local failure_path=""
+
   for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
     if ((10#${NUM_TRIALS} == 1)); then
-      video_stem="${video_dir}/${task_id}_rollout"
+      video_path="${video_dir}/${task_id}_rollout.mp4"
     else
-      printf -v video_stem '%s/%s_rollout_trial_%03d' \
-        "${video_dir}" "${task_id}" "${trial_number}"
+      printf -v video_path '%s/%s_rollout_trial_%03d.mp4' "${video_dir}" "${task_id}" "${trial_number}"
     fi
-    scored_paths=()
-    for candidate_path in \
-      "${video_stem}_success.mp4" \
-      "${video_stem}_failure.mp4"; do
-      [[ -e "${candidate_path}" ]] && scored_paths+=("${candidate_path}")
-    done
-    shopt -s nullglob
-    retry_paths=(
-      "${video_stem}"_retry_*_success.mp4
-      "${video_stem}"_retry_*_failure.mp4
-    )
-    shopt -u nullglob
-    scored_paths+=("${retry_paths[@]}")
-    ((${#scored_paths[@]} == 1)) || return 1
-    [[ -s "${scored_paths[0]}" ]] || return 1
+    if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+      success_path="${video_path%.mp4}_success.mp4"
+      failure_path="${video_path%.mp4}_failure.mp4"
+      if [[ -s "${success_path}" && ! -e "${failure_path}" ]]; then
+        continue
+      fi
+      if [[ -s "${failure_path}" && ! -e "${success_path}" ]]; then
+        continue
+      fi
+      return 1
+    fi
+    [[ -s "${video_path}" ]] || return 1
   done
   return 0
 }
@@ -479,14 +493,16 @@ append_task_result() {
   local task_id="$1"
   local status="$2"
   local benchmark_config="$3"
-  local video_dir="$4"
-  local reason="$5"
+  local task_max_steps="$4"
+  local video_dir="$5"
+  local reason="$6"
   local video_count=""
   video_count="$(count_videos "${video_dir}")"
   {
     printf '\n[%s]\n' "${task_id}"
     printf 'status=%s\n' "${status}"
     printf 'benchmark=%s\n' "${benchmark_config}"
+    printf 'max_steps=%s\n' "${task_max_steps}"
     printf 'trials=%s\n' "${LAST_TRIALS:-N/A}"
     printf 'successes=%s\n' "${LAST_SUCCESSES:-N/A}"
     printf 'failures=%s\n' "${LAST_FAILURES:-N/A}"
@@ -500,24 +516,23 @@ append_task_result() {
 run_task() {
   local task_id="$1"
   local benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+  local task_max_steps=""
   local task_result_dir="${RESULT_DIR}/${task_id}"
   local server_log="${task_result_dir}/server.log"
   local client_log="${task_result_dir}/client.log"
   local video_dir="${task_result_dir}/videos"
   local process_status=0
-  local max_steps_label="${MAX_STEPS}"
 
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  fi
-
+  task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
   LAST_TRIALS=0
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
   mkdir -p "${video_dir}" || return 1
-  build_commands "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  log "server_log=${server_log}"
+  log "client_log=${client_log}"
 
   (
     cd -- "${MOTIONFORGE_ROOT}"
@@ -531,7 +546,9 @@ run_task() {
     cd -- "${LEROBOT_ROOT}"
     export CUDA_VISIBLE_DEVICES="${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}"
     export PYTHONDONTWRITEBYTECODE=1
-    export PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export PYTHONPATH="${BRIDGE_PYTHONPATH}"
     exec "${BRIDGE_COMMAND[@]}"
   ) >"${client_log}" 2>&1 &
   BRIDGE_PID="$!"
@@ -542,22 +559,23 @@ run_task() {
     process_status="$?"
   fi
   if ((process_status != 0)); then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server/client process exit status ${process_status}"
     return "${process_status}"
   fi
   if ! parse_task_summary "${server_log}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server log has no valid ${NUM_TRIALS}-trial summary"
     return 1
   fi
   if ! validate_video_outputs "${task_id}" "${video_dir}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
-      "expected ${NUM_TRIALS} non-empty rollout videos with success/failure suffixes"
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
+      "expected ${NUM_TRIALS} non-empty rollout videos with unambiguous outcome suffixes"
     return 1
   fi
-  append_task_result "${task_id}" completed "${benchmark_config}" "${video_dir}" "none"
+  append_task_result "${task_id}" completed "${benchmark_config}" "${task_max_steps}" "${video_dir}" "none"
   log "completed task=${task_id} successes=${LAST_SUCCESSES}/${LAST_TRIALS} success_rate=${LAST_SUCCESS_RATE}"
+  return 0
 }
 
 append_overall_summary() {
@@ -569,12 +587,15 @@ append_overall_summary() {
   local expected_tasks="${#TASK_IDS[@]}"
   local expected_trials=$((expected_tasks * NUM_TRIALS))
   local total_success_rate="N/A"
+  local partial_success_rate="N/A"
   local overall_status="incomplete"
+
   if ((completed_trials > 0)); then
-    total_success_rate="$(awk -v successes="${total_successes}" -v trials="${completed_trials}" 'BEGIN { printf "%.3f", successes / trials }')"
+    partial_success_rate="$(awk -v successes="${total_successes}" -v trials="${completed_trials}" 'BEGIN { printf "%.3f", successes / trials }')"
   fi
   if ((completed_tasks == expected_tasks && failed_tasks == 0 && completed_trials == expected_trials)); then
     overall_status="completed"
+    total_success_rate="${partial_success_rate}"
   fi
   {
     printf '\n[overall]\n'
@@ -587,6 +608,7 @@ append_overall_summary() {
     printf 'total_successes=%s\n' "${total_successes}"
     printf 'total_failures=%s\n' "${total_failures}"
     printf 'total_success_rate=%s\n' "${total_success_rate}"
+    printf 'partial_success_rate=%s\n' "${partial_success_rate}"
     printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
   } >>"${SUMMARY_FILE}"
 }
@@ -594,19 +616,16 @@ append_overall_summary() {
 validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  log "ood_lighting=${OOD_LIGHTING}"
   log "validated configuration; no process or result directory will be created"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  else
-    max_steps_label="${MAX_STEPS}"
-  fi
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label} motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE} timing=benchmark_config num_inference_steps=${DIFFUSION_NUM_INFERENCE_STEPS}"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} num_inference_steps=${DIFFUSION_NUM_INFERENCE_STEPS} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "model=${DIFFUSION_MODEL_PATH} result_dir=${RESULT_DIR} policy_seed=server_reset"
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
     video_dir="${RESULT_DIR}/${task_id}/videos"
-    build_commands "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-    log "dry-run task=${task_id} benchmark=${benchmark_config}"
+    build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${task_id}_rollout.mp4"
+    log "dry-run task=${task_id} max_steps=${task_max_steps} benchmark=${benchmark_config}"
     print_command "${MOTIONFORGE_ROOT}" "${SERVER_COMMAND[@]}"
     print_bridge_command
   done
@@ -618,35 +637,32 @@ if [[ -e "${RESULT_DIR}" ]]; then
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'Diffusion Policy FC000-FC009 MotionForge evaluation\n'
+  printf 'Diffusion Policy CM000-CM009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${DIFFUSION_MODEL_PATH}"
   printf 'device=%s\n' "${DIFFUSION_DEVICE}"
-  printf 'motionforge_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
   printf 'cuda_visible_devices=%s\n' "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'policy_seed=%s\n' 'server_reset'
   printf 'num_inference_steps=%s\n' "${DIFFUSION_NUM_INFERENCE_STEPS}"
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
+  printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
   printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    printf 'max_steps_per_trial=benchmark_config\n'
-  else
-    printf 'max_steps_per_trial=%s\n' "${MAX_STEPS}"
-  fi
-  printf 'motion_level=%s\n' "${MOTION_LEVEL:-benchmark_config}"
+  printf 'max_steps_source=benchmark_config\n'
+  printf 'timing_source=benchmark_config\n'
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
-  printf 'initial_position_mode=%s\n' "${INITIAL_POSITION_MODE}"
-  printf 'timing_source=benchmark_config\n'
+  printf 'initial_position_mode=fixed\n'
   printf 'observation_horizon=2\n'
   printf 'diffusion_horizon=64\n'
   printf 'action_horizon=32\n'
   printf 'video_enabled=true\n'
-  printf 'video_outcome_suffix=true\n'
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"
   printf 'video_stride=%s\n' "${VIDEO_STRIDE}"
+  printf 'video_outcome_suffix=%s\n' "${VIDEO_OUTCOME_SUFFIX}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0

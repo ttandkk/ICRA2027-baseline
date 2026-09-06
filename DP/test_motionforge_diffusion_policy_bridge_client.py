@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import re
 import unittest
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import motionforge_diffusion_policy_bridge_client as bridge
 import numpy as np
@@ -15,16 +17,22 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 CHECKPOINT = (
     WORKSPACE_ROOT
     / "ckpts"
-    / "MotionforgeGroup"
-    / "DiffusionPolicy"
-    / "FC-80000-3views"
+    / "DiffusionPolicy-FC-80000-3views"
 )
 CM_CHECKPOINT = (
     WORKSPACE_ROOT
     / "ckpts"
-    / "MotionforgeGroup"
-    / "DiffusionPolicy"
-    / "CM-80000-3views"
+    / "DiffusionPolicy-CM-80000-3views"
+)
+HT_CHECKPOINT = (
+    WORKSPACE_ROOT
+    / "ICRA2027-baseline"
+    / "DP"
+    / "train_outputs"
+    / "diffusion_lerobot_ht_129916"
+    / "checkpoints"
+    / "080000"
+    / "pretrained_model"
 )
 
 
@@ -51,6 +59,23 @@ class ThreeViewObservationTest(unittest.TestCase):
         message = bridge.synthetic_message()
         observation = bridge.build_diffusion_observation(
             message,
+            config.input_features,
+            image_transform,
+        )
+
+        self.assertEqual(set(observation), {bridge.STATE_KEY, *bridge.IMAGE_KEYS})
+        for key in bridge.IMAGE_KEYS:
+            self.assertEqual(tuple(observation[key].shape), (3, 240, 320))
+            self.assertEqual(observation[key].dtype, torch.float32)
+
+    def test_ht_checkpoint_contract_and_training_transform(self) -> None:
+        """Accept the HT checkpoint only with its serialized three-view resize."""
+        bridge.validate_checkpoint_files(HT_CHECKPOINT)
+        config = bridge.load_diffusion_config(HT_CHECKPOINT, "cpu")
+        bridge.validate_diffusion_contract(HT_CHECKPOINT, config)
+        image_transform = bridge.load_training_image_transform(HT_CHECKPOINT)
+        observation = bridge.build_diffusion_observation(
+            bridge.synthetic_message(),
             config.input_features,
             image_transform,
         )
@@ -115,6 +140,48 @@ class ThreeViewObservationTest(unittest.TestCase):
                 self.config.input_features,
                 self.image_transform,
             )
+
+
+class LifecycleResetTest(unittest.TestCase):
+    """Verify RESET clears state and restores the server-selected RNG stream."""
+
+    def test_reset_replays_rng_and_clears_history(self) -> None:
+        class Resettable:
+            def __init__(self) -> None:
+                self.reset_calls = 0
+
+            def reset(self) -> None:
+                self.reset_calls += 1
+
+        inference = object.__new__(bridge.DiffusionPolicyInference)
+        inference.policy = Resettable()
+        inference.preprocessor = Resettable()
+        inference.postprocessor = Resettable()
+        inference.observation_history = deque([{"stale": torch.ones(1)}], maxlen=2)
+        inference.noise_generator = torch.Generator(device="cpu")
+        inference._current_policy_seed = 0
+
+        reset = SimpleNamespace(seed=1234)
+        inference.reset(reset)
+        first = torch.randn(8, generator=inference.noise_generator)
+        inference.observation_history.append({"stale": torch.ones(1)})
+        inference.reset(reset)
+        second = torch.randn(8, generator=inference.noise_generator)
+
+        self.assertEqual(inference.current_policy_seed, 1234)
+        self.assertEqual(len(inference.observation_history), 0)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        for component in (
+            inference.policy,
+            inference.preprocessor,
+            inference.postprocessor,
+        ):
+            self.assertEqual(component.reset_calls, 2)
+
+    def test_reset_rejects_seed_outside_protocol_range(self) -> None:
+        inference = object.__new__(bridge.DiffusionPolicyInference)
+        with self.assertRaisesRegex(ValueError, "RESET seed"):
+            inference.reset(SimpleNamespace(seed=2**63 - 1))
 
 
 if __name__ == "__main__":

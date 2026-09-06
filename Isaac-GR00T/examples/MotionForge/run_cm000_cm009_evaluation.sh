@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=gr00t_cm000_cm009_eval
+#SBATCH --partition=cluster02
+#SBATCH --gres=gpu:rtx5090:1
+#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --output=logs/gr00t_cm000_cm009_eval_%j.out
+#SBATCH --error=logs/gr00t_cm000_cm009_eval_%j.err
+
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -11,8 +20,8 @@ TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
 BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion"
 RUNTIME_ASSET_DIR="${MOTIONFORGE_ROOT}/source/motionforge/motionforge/assets/runtime"
 
-GROOT_MODEL_PATH="${GROOT_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/gr00t1.7/CM-80000}"
-GROOT_TRT_ENGINE_PATH="${GROOT_TRT_ENGINE_PATH:-${GROOT_ROOT}/gr00t_trt_deployments/gr00t_trt_deployment_gr00t1.7-CM-80000_square/engines}"
+GROOT_MODEL_PATH="${GROOT_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/gr00t1.7-CM-80000}"
+GROOT_TRT_ENGINE_PATH="${GROOT_TRT_ENGINE_PATH:-${GROOT_ROOT}/gr00t_trt_deployments/gr00t_trt_deployment_gr00t1.7-CM-80000/engines}"
 GROOT_PYTHON="${GROOT_PYTHON:-${GROOT_ROOT}/.venv/bin/python}"
 GROOT_FFMPEG_PREFIX="${GROOT_FFMPEG_PREFIX:-${WORKSPACE_ROOT}/.cache/gr00t-ffmpeg}"
 GROOT_ACCEL_MODE="${GROOT_ACCEL_MODE:-trt_full_pipeline}"
@@ -21,6 +30,7 @@ GROOT_EMBODIMENT_TAG="${GROOT_EMBODIMENT_TAG:-NEW_EMBODIMENT}"
 GROOT_BACKBONE_MODEL_PATH="${GROOT_BACKBONE_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/nvidia/Cosmos-Reason2-2B}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
+MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 # CM compound containers and articulated payloads require CPU PhysX to match
 # the data-generation environment. Rendering and GR00T/TensorRT still use the
 # GPU selected by CM_EVAL_CUDA_VISIBLE_DEVICES.
@@ -30,29 +40,26 @@ CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
 START_SEED="${CM_EVAL_START_SEED:-0}"
-NUM_TRIALS="${CM_EVAL_NUM_TRIALS:-10}"
-CM_EVAL_CLOCK_MODE="${CM_EVAL_CLOCK_MODE:-wall_clock_strict}"
-CM_EVAL_ACTION_ALIGNMENT="${CM_EVAL_ACTION_ALIGNMENT:-observation_aligned}"
+NUM_TRIALS="${CM_EVAL_NUM_TRIALS:-50}"
+ATTEMPTS_PER_WORKER="${GROOT_EVAL_ATTEMPTS_PER_WORKER:-50}"
 OBS_PORT="${CM_EVAL_OBS_PORT:-3396}"
 ACT_PORT="${CM_EVAL_ACT_PORT:-3398}"
-CLIENT_WARMUP_S="${CM_EVAL_CLIENT_WARMUP_S:-5}"
 TASK_TIMEOUT_S="${CM_EVAL_TASK_TIMEOUT_S:-14400}"
 BETWEEN_TASKS_S="${CM_EVAL_BETWEEN_TASKS_S:-5}"
 
-GROOT_EXECUTION_HORIZON="${GROOT_EXECUTION_HORIZON:-8}"
-GROOT_ACTION_HZ="${GROOT_ACTION_HZ:-30}"
-GROOT_MAX_INFERENCE_HZ="${GROOT_MAX_INFERENCE_HZ:-30}"
 GROOT_PRINT_EVERY="${GROOT_PRINT_EVERY:-10}"
 
 VIDEO_WIDTH="${CM_EVAL_VIDEO_WIDTH:-640}"
 VIDEO_HEIGHT="${CM_EVAL_VIDEO_HEIGHT:-480}"
 VIDEO_STRIDE="${CM_EVAL_VIDEO_STRIDE:-1}"
+VIDEO_OUTCOME_SUFFIX="${CM_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/outputs"
-RUN_ID="${CM_EVAL_RUN_ID:-cm000_cm010_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${CM_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/outputs}"
+RUN_ID="${CM_EVAL_RUN_ID:-cm000_cm009_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
+OOD_LIGHTING="${CM_EVAL_OOD_LIGHTING-0}"
 
 DEFAULT_TASK_IDS=(
   cm_000
@@ -61,10 +68,10 @@ DEFAULT_TASK_IDS=(
   cm_003
   cm_004
   cm_005
+  cm_006
   cm_007
   cm_008
   cm_009
-  cm_010
 )
 
 if [[ -n "${CM_EVAL_TASKS:-}" ]]; then
@@ -82,14 +89,13 @@ LAST_TRIALS=0
 LAST_SUCCESSES=0
 LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
-LAST_RAW_SUMMARY=""
 
 log() {
-  printf '[CM000-CM010-EVAL] %s\n' "$*"
+  printf '[CM000-CM009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[CM000-CM010-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[CM000-CM009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -192,7 +198,11 @@ validate_configuration() {
 
   require_executable "${GROOT_PYTHON}"
   require_dir "${GROOT_FFMPEG_PREFIX}/lib"
-  require_executable "${CONDA_EXE}"
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    require_executable "${MOTIONFORGE_PYTHON}"
+  else
+    require_executable "${CONDA_EXE}"
+  fi
   require_executable "${TIMEOUT_EXE}"
   command -v awk >/dev/null 2>&1 || die "required executable not found: awk"
 
@@ -231,18 +241,11 @@ validate_configuration() {
 
   require_uint_at_least "CM_EVAL_START_SEED" "${START_SEED}" 0
   require_uint_at_least "CM_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
-  [[ "${CM_EVAL_CLOCK_MODE}" == "wall_clock_strict" ]] || die \
-    "CM_EVAL_CLOCK_MODE must be wall_clock_strict for realtime CM evaluation; got ${CM_EVAL_CLOCK_MODE}"
-  [[ "${CM_EVAL_ACTION_ALIGNMENT}" == "observation_aligned" ]] || die \
-    "CM_EVAL_ACTION_ALIGNMENT must be observation_aligned for realtime CM evaluation; got ${CM_EVAL_ACTION_ALIGNMENT}"
+  require_uint_at_least "GROOT_EVAL_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
   require_uint_at_least "CM_EVAL_OBS_PORT" "${OBS_PORT}" 1
   require_uint_at_least "CM_EVAL_ACT_PORT" "${ACT_PORT}" 1
-  require_uint_at_least "CM_EVAL_CLIENT_WARMUP_S" "${CLIENT_WARMUP_S}" 0
   require_uint_at_least "CM_EVAL_TASK_TIMEOUT_S" "${TASK_TIMEOUT_S}" 1
   require_uint_at_least "CM_EVAL_BETWEEN_TASKS_S" "${BETWEEN_TASKS_S}" 0
-  require_uint_at_least "GROOT_EXECUTION_HORIZON" "${GROOT_EXECUTION_HORIZON}" 1
-  require_uint_at_least "GROOT_ACTION_HZ" "${GROOT_ACTION_HZ}" 1
-  require_uint_at_least "GROOT_MAX_INFERENCE_HZ" "${GROOT_MAX_INFERENCE_HZ}" 1
   require_uint_at_least "GROOT_PRINT_EVERY" "${GROOT_PRINT_EVERY}" 0
   require_uint_at_least "CM_EVAL_VIDEO_WIDTH" "${VIDEO_WIDTH}" 2
   require_uint_at_least "CM_EVAL_VIDEO_HEIGHT" "${VIDEO_HEIGHT}" 2
@@ -252,6 +255,14 @@ validate_configuration() {
   ((10#${ACT_PORT} <= 65535)) || die "CM_EVAL_ACT_PORT must be <= 65535"
   [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
+  [[ "${OOD_LIGHTING}" == "0" || "${OOD_LIGHTING}" == "1" ]] \
+    || die "CM_EVAL_OOD_LIGHTING must be 0 or 1"
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "lighting OOD requires all trial seeds to be in 0-49"
+  fi
+  [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
+    || die "CM_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
   [[ -n "${CM_EVAL_CUDA_VISIBLE_DEVICES}" ]] || die "CM_EVAL_CUDA_VISIBLE_DEVICES must not be empty"
   [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] || die "CM_EVAL_RUN_ID may contain only letters, numbers, dot, underscore, and hyphen"
 }
@@ -282,18 +293,27 @@ build_commands() {
   local task_max_steps="$2"
   local video_dir="$3"
   local video_name="$4"
+  local server_python_command=()
+
+  if [[ -n "${MOTIONFORGE_PYTHON}" ]]; then
+    server_python_command=("${MOTIONFORGE_PYTHON}")
+  else
+    server_python_command=(
+      "${CONDA_EXE}"
+      run
+      --no-capture-output
+      -n
+      "${MOTIONFORGE_CONDA_ENV}"
+      python
+    )
+  fi
 
   SERVER_COMMAND=(
     "${TIMEOUT_EXE}"
     --signal=TERM
     --kill-after=30s
     "${TASK_TIMEOUT_S}s"
-    "${CONDA_EXE}"
-    run
-    --no-capture-output
-    -n
-    "${MOTIONFORGE_CONDA_ENV}"
-    python
+    "${server_python_command[@]}"
     "${TRIALS_SERVER}"
     --benchmark_config
     "${benchmark_config}"
@@ -301,6 +321,8 @@ build_commands() {
     "${START_SEED}"
     --num_trials
     "${NUM_TRIALS}"
+    --attempts_per_worker
+    "${ATTEMPTS_PER_WORKER}"
     --max_steps
     "${task_max_steps}"
     --initial_position_mode
@@ -311,10 +333,6 @@ build_commands() {
     "${OBS_PORT}"
     --act_port
     "${ACT_PORT}"
-    --client_warmup
-    "${CLIENT_WARMUP_S}"
-    --clock_mode
-    "${CM_EVAL_CLOCK_MODE}"
     --video_dir
     "${video_dir}"
     --video_name
@@ -326,6 +344,13 @@ build_commands() {
     --video_stride
     "${VIDEO_STRIDE}"
   )
+
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_lighting)
+  fi
+  if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+    SERVER_COMMAND+=(--video_outcome_suffix)
+  fi
 
   BRIDGE_COMMAND=(
     "${TIMEOUT_EXE}"
@@ -350,14 +375,6 @@ build_commands() {
     flat
     --num-episodes
     "${NUM_TRIALS}"
-    --execution-horizon
-    "${GROOT_EXECUTION_HORIZON}"
-    --action-hz
-    "${GROOT_ACTION_HZ}"
-    --action-alignment
-    "${CM_EVAL_ACTION_ALIGNMENT}"
-    --max-inference-hz
-    "${GROOT_MAX_INFERENCE_HZ}"
     --print-every
     "${GROOT_PRINT_EVERY}"
     --no-groot-strict
@@ -434,7 +451,6 @@ parse_task_summary() {
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
 
   summary_line="$(grep -F '[MOTIONFORGE-BENCH] trials_summary ' "${server_log}" | tail -n 1 || true)"
   [[ -n "${summary_line}" ]] || return 1
@@ -444,7 +460,6 @@ parse_task_summary() {
   LAST_SUCCESSES="${BASH_REMATCH[2]}"
   LAST_FAILURES="${BASH_REMATCH[3]}"
   LAST_SUCCESS_RATE="${BASH_REMATCH[4]}"
-  LAST_RAW_SUMMARY="${summary_line}"
 
   ((10#${LAST_TRIALS} == 10#${NUM_TRIALS})) || return 1
   ((10#${LAST_SUCCESSES} + 10#${LAST_FAILURES} == 10#${LAST_TRIALS})) || return 1
@@ -465,12 +480,25 @@ validate_video_outputs() {
   local video_dir="$2"
   local trial_number=0
   local video_path=""
+  local success_path=""
+  local failure_path=""
 
   for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
     if ((10#${NUM_TRIALS} == 1)); then
       video_path="${video_dir}/${task_id}_rollout.mp4"
     else
       printf -v video_path '%s/%s_rollout_trial_%03d.mp4' "${video_dir}" "${task_id}" "${trial_number}"
+    fi
+    if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+      success_path="${video_path%.mp4}_success.mp4"
+      failure_path="${video_path%.mp4}_failure.mp4"
+      if [[ -s "${success_path}" && ! -e "${failure_path}" ]]; then
+        continue
+      fi
+      if [[ -s "${failure_path}" && ! -e "${success_path}" ]]; then
+        continue
+      fi
+      return 1
     fi
     [[ -s "${video_path}" ]] || return 1
   done
@@ -528,7 +556,6 @@ append_completed_task() {
     printf 'success_rate=%s\n' "${LAST_SUCCESS_RATE}"
     printf 'video_dir=%s\n' "${video_dir}"
     printf 'video_count=%s\n' "${video_count}"
-    printf 'raw_summary=%s\n' "${LAST_RAW_SUMMARY}"
   } >>"${SUMMARY_FILE}"
 }
 
@@ -548,12 +575,11 @@ run_task() {
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
-  LAST_RAW_SUMMARY=""
 
   mkdir -p "${video_dir}" || return 1
   build_commands "${benchmark_config}" "${task_max_steps}" "${video_dir}" "${video_name}"
 
-  log "starting task=${task_id} trials=${NUM_TRIALS} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps} seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
   log "server_log=${server_log}"
   log "client_log=${client_log}"
 
@@ -640,8 +666,9 @@ append_overall_summary() {
 validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  log "ood_lighting=${OOD_LIGHTING}"
   log "validated configuration; no process or result directory will be created"
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} max_steps=benchmark_config clock_mode=${CM_EVAL_CLOCK_MODE} action_alignment=${CM_EVAL_ACTION_ALIGNMENT} physics_device=${MOTIONFORGE_DEVICE} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "result_dir=${RESULT_DIR}"
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
@@ -660,7 +687,7 @@ if [[ -e "${RESULT_DIR}" ]]; then
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'CM000-CM010 MotionForge evaluation\n'
+  printf 'CM000-CM009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${GROOT_MODEL_PATH}"
   printf 'accel_mode=%s\n' "${GROOT_ACCEL_MODE}"
@@ -668,12 +695,13 @@ mkdir -p "${RESULT_DIR}"
   printf 'backbone_model_path=%s\n' "${GROOT_BACKBONE_MODEL_PATH}"
   printf 'cuda_visible_devices=%s\n' "${CM_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
   printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
+  printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
   printf 'max_steps_source=benchmark_config\n'
-  printf 'clock_mode=%s\n' "${CM_EVAL_CLOCK_MODE}"
-  printf 'action_alignment=%s\n' "${CM_EVAL_ACTION_ALIGNMENT}"
+  printf 'timing_source=benchmark_config\n'
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
   printf 'initial_position_mode=fixed\n'
@@ -681,6 +709,7 @@ mkdir -p "${RESULT_DIR}"
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"
   printf 'video_stride=%s\n' "${VIDEO_STRIDE}"
+  printf 'video_outcome_suffix=%s\n' "${VIDEO_OUTCOME_SUFFIX}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0

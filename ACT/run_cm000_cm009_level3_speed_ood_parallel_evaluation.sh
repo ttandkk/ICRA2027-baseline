@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 WORKSPACE_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
-SINGLE_LANE_RUNNER="${SCRIPT_DIR}/run_cm000_cm010_evaluation.sh"
-OUTPUT_ROOT="${ACT_CM_LEVEL3_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output/circular_motion/cm000_cm010/level3_speed_ood_fixed/control60_server_scheduled_v1}"
+SINGLE_LANE_RUNNER="${SCRIPT_DIR}/run_cm000_cm009_evaluation.sh"
+OUTPUT_ROOT="${ACT_CM_LEVEL3_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output/circular_motion/cm000_cm009/level3_speed_ood_fixed/server_scheduled}"
 SOURCE_MOTIONFORGE_ROOT="${MOTIONFORGE_ROOT:-${WORKSPACE_ROOT}/MotionForge}"
 
 BATCH_ID="${ACT_CM_LEVEL3_EVAL_BATCH_ID:-act_cm_level3_speed_ood_parallel2_$(date +%Y%m%d_%H%M%S)}"
@@ -14,9 +14,9 @@ GPU_LIST="${ACT_CM_LEVEL3_EVAL_GPUS:-3}"
 REQUIRE_IDLE_GPUS="${ACT_CM_LEVEL3_EVAL_REQUIRE_IDLE_GPUS:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
-# The split is balanced by the v2 sum of benchmark max_steps: 11220 vs. 11160.
-LANE_ONE_TASKS_VALUE="${ACT_CM_LEVEL3_EVAL_LANE1_TASKS:-cm_000 cm_003 cm_005 cm_007 cm_010}"
-LANE_TWO_TASKS_VALUE="${ACT_CM_LEVEL3_EVAL_LANE2_TASKS:-cm_001 cm_002 cm_004 cm_008 cm_009}"
+# Balanced by the current 60 Hz benchmark max_steps: 3849 vs. 4128.
+LANE_ONE_TASKS_VALUE="${ACT_CM_LEVEL3_EVAL_LANE1_TASKS:-cm_001 cm_003 cm_005 cm_009}"
+LANE_TWO_TASKS_VALUE="${ACT_CM_LEVEL3_EVAL_LANE2_TASKS:-cm_000 cm_002 cm_004 cm_006 cm_007 cm_008}"
 LANE_ONE_OBS_PORT="${ACT_CM_LEVEL3_EVAL_LANE1_OBS_PORT:-3396}"
 LANE_ONE_ACT_PORT="${ACT_CM_LEVEL3_EVAL_LANE1_ACT_PORT:-3398}"
 LANE_TWO_OBS_PORT="${ACT_CM_LEVEL3_EVAL_LANE2_OBS_PORT:-3496}"
@@ -29,10 +29,10 @@ ALL_TASKS=(
   cm_003
   cm_004
   cm_005
+  cm_006
   cm_007
   cm_008
   cm_009
-  cm_010
 )
 
 read -r -a GPUS <<<"${GPU_LIST}"
@@ -72,7 +72,7 @@ validate_task_partition() {
   ((${#LANE_TWO_TASKS[@]} > 0)) || die "lane 2 must contain at least one task"
 
   for task in "${LANE_ONE_TASKS[@]}" "${LANE_TWO_TASKS[@]}"; do
-    [[ "${task}" =~ ^cm_(00[0-5]|00[7-9]|010)$ ]] \
+    [[ "${task}" =~ ^cm_00[0-9]$ ]] \
       || die "invalid CM task id in lane partition: ${task}"
     [[ -z "${seen[${task}]:-}" ]] || die "task appears in more than one lane: ${task}"
     seen["${task}"]=1
@@ -81,7 +81,7 @@ validate_task_partition() {
     [[ -n "${seen[${expected}]:-}" ]] || die "lane partition is missing task: ${expected}"
   done
   ((${#seen[@]} == ${#ALL_TASKS[@]})) \
-    || die "lane partition must contain exactly the 10 supported CM tasks"
+    || die "lane partition must contain exactly the 11 supported CM tasks"
 }
 
 validate_distinct_ports() {
@@ -150,6 +150,8 @@ validate_configuration() {
     || die "MotionForge root does not exist: ${SOURCE_MOTIONFORGE_ROOT}"
   [[ -d "${SOURCE_MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion" ]] \
     || die "CM benchmark directory does not exist under ${SOURCE_MOTIONFORGE_ROOT}"
+  [[ -f "${SOURCE_MOTIONFORGE_ROOT}/configs/benchmarks/timing_profiles.yaml" ]] \
+    || die "timing profile config does not exist under ${SOURCE_MOTIONFORGE_ROOT}"
   awk '
     /^[[:space:]]*--initial_position_mode[[:space:]]*$/ {
       if (getline > 0 && $0 ~ /^[[:space:]]*fixed[[:space:]]*$/) {
@@ -174,7 +176,7 @@ validate_configuration() {
   [[ "${REQUIRE_IDLE_GPUS}" == "0" || "${REQUIRE_IDLE_GPUS}" == "1" ]] \
     || die "ACT_CM_LEVEL3_EVAL_REQUIRE_IDLE_GPUS must be 0 or 1"
   ((${#GPUS[@]} == 1)) && [[ "${GPUS[0]}" == "3" ]] \
-    || die "ACT_CM_LEVEL3_EVAL_GPUS must contain only GPU 3 for the CM v2 protocol"
+    || die "ACT_CM_LEVEL3_EVAL_GPUS must contain only GPU 3 for this evaluation"
   LANE_EXECUTION_MODE="sequential"
   LANE_ONE_GPU="3"
   LANE_TWO_GPU="3"
@@ -222,6 +224,8 @@ create_level3_motionforge_root() {
   mkdir -p "${TEMP_MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion"
   ln -s "${SOURCE_MOTIONFORGE_ROOT}/scripts" "${TEMP_MOTIONFORGE_ROOT}/scripts"
   ln -s "${SOURCE_MOTIONFORGE_ROOT}/source" "${TEMP_MOTIONFORGE_ROOT}/source"
+  ln -s "${SOURCE_MOTIONFORGE_ROOT}/configs/benchmarks/timing_profiles.yaml" \
+    "${TEMP_MOTIONFORGE_ROOT}/configs/benchmarks/timing_profiles.yaml"
 
   for task in "${ALL_TASKS[@]}"; do
     source_config="${SOURCE_MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion/${task}_rgb_gr00t_zmq.yaml"
@@ -266,7 +270,6 @@ run_lane() {
     ACT_EVAL_NUM_TRIALS="${NUM_TRIALS}" \
     ACT_EVAL_START_SEED="${START_SEED}" \
     ACT_EVAL_CUDA_VISIBLE_DEVICES="${gpu}" \
-    ACT_EVAL_CLOCK_MODE="slowdown_scaled" \
     ACT_EVAL_OBS_PORT="${obs_port}" \
     ACT_EVAL_ACT_PORT="${act_port}" \
     ACT_EVAL_VIDEO_OUTCOME_SUFFIX="1" \
@@ -354,16 +357,14 @@ write_combined_summary() {
   local partial_success_rate="N/A"
 
   {
-    printf 'ACT CM000-CM010 Level 3 speed OOD parallel evaluation\n'
+    printf 'ACT CM000-CM009 Level 3 speed OOD parallel evaluation\n'
     printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
     printf 'batch_id=%s\n' "${BATCH_ID}"
     printf 'source_benchmark_motion_level=level2\n'
     printf 'evaluation_motion_level=level3\n'
     printf 'initial_position_mode=fixed\n'
     printf 'ood_axis=speed\n'
-    printf 'clock_mode=slowdown_scaled\n'
-    printf 'timing_protocol=motionforge.slowdown_scaled.server.v1\n'
-    printf 'control_hz=60\n'
+    printf 'timing_source=benchmark_config\n'
     printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
     printf 'seed_start=%s\n' "${START_SEED}"
     printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"

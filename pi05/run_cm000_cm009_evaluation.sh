@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=pi05_fc000_fc009_eval
+#SBATCH --job-name=pi05_cm000_cm009_eval
 #SBATCH --partition=cluster02
 #SBATCH --gres=gpu:rtx5090:1
 #SBATCH --time=48:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --output=logs/pi05_fc000_fc009_eval_%j.out
-#SBATCH --error=logs/pi05_fc000_fc009_eval_%j.err
+#SBATCH --output=logs/pi05_cm000_cm009_eval_%j.out
+#SBATCH --error=logs/pi05_cm000_cm009_eval_%j.err
 
 set -Eeuo pipefail
 
@@ -23,18 +23,20 @@ LEROBOT_ROOT="${LEROBOT_ROOT:-${WORKSPACE_ROOT}/lerobot}"
 
 BRIDGE_CLIENT="${SCRIPT_DIR}/motionforge_pi05_bridge_client.py"
 TRIALS_SERVER="${MOTIONFORGE_ROOT}/scripts/benchmark/run_env_server_trials.py"
-BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/factory_conveyor"
+BENCHMARK_DIR="${MOTIONFORGE_ROOT}/configs/benchmarks/circular_motion"
+RUNTIME_ASSET_DIR="${MOTIONFORGE_ROOT}/source/motionforge/motionforge/assets/runtime"
 
-PI05_MODEL_PATH="${PI05_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/pi05/FC-80000/pretrained_model}"
+PI05_MODEL_PATH="${PI05_MODEL_PATH:-${WORKSPACE_ROOT}/ckpts/MotionforgeGroup/pi05/CM-80000}"
 PI05_PYTHON="${PI05_PYTHON:-${WORKSPACE_ROOT}/miniconda3/envs/lerobot/bin/python}"
 PI05_DEVICE="${PI05_DEVICE:-cuda:0}"
 PI05_TOKENIZER_PATH="${PI05_TOKENIZER_PATH:-google/paligemma-3b-pt-224}"
 PI05_PRINT_EVERY="${PI05_PRINT_EVERY:-10}"
 
 MOTIONFORGE_CONDA_ENV="${MOTIONFORGE_CONDA_ENV:-motionforge}"
-# Keep physics on CPU while AppLauncher renders on the selected visible GPU.
+# CM compound containers and articulated payloads require CPU PhysX. Rendering
+# and PI0.5 inference still use the selected visible GPU.
 MOTIONFORGE_DEVICE="${MOTIONFORGE_DEVICE:-cpu}"
-PI05_EVAL_CUDA_VISIBLE_DEVICES="${PI05_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-2}}"
+PI05_EVAL_CUDA_VISIBLE_DEVICES="${PI05_EVAL_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-3}}"
 MOTIONFORGE_PYTHON="${MOTIONFORGE_PYTHON:-}"
 CONDA_EXE="${MOTIONFORGE_CONDA_EXE:-${WORKSPACE_ROOT}/miniconda3/bin/conda}"
 TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
@@ -42,13 +44,11 @@ TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 START_SEED="${PI05_EVAL_START_SEED:-0}"
 NUM_TRIALS="${PI05_EVAL_NUM_TRIALS:-50}"
 ATTEMPTS_PER_WORKER="${MOTIONFORGE_ATTEMPTS_PER_WORKER:-50}"
-# Keep an explicit override available, but use each benchmark YAML by default.
-MAX_STEPS="${PI05_EVAL_MAX_STEPS:-1400}"
 USE_BENCHMARK_MAX_STEPS="${PI05_EVAL_USE_BENCHMARK_MAX_STEPS:-1}"
 MOTION_LEVEL="${PI05_EVAL_MOTION_LEVEL:-}"
 INITIAL_POSITION_MODE="${PI05_EVAL_INITIAL_POSITION_MODE:-fixed}"
-OBS_PORT="${PI05_EVAL_OBS_PORT:-3196}"
-ACT_PORT="${PI05_EVAL_ACT_PORT:-3198}"
+OBS_PORT="${PI05_EVAL_OBS_PORT:-3396}"
+ACT_PORT="${PI05_EVAL_ACT_PORT:-3398}"
 CLIENT_READY_TIMEOUT_S="${PI05_EVAL_CLIENT_READY_TIMEOUT_S:-600}"
 TASK_TIMEOUT_S="${PI05_EVAL_TASK_TIMEOUT_S:-14400}"
 BETWEEN_TASKS_S="${PI05_EVAL_BETWEEN_TASKS_S:-5}"
@@ -56,24 +56,26 @@ BETWEEN_TASKS_S="${PI05_EVAL_BETWEEN_TASKS_S:-5}"
 VIDEO_WIDTH="${PI05_EVAL_VIDEO_WIDTH:-640}"
 VIDEO_HEIGHT="${PI05_EVAL_VIDEO_HEIGHT:-480}"
 VIDEO_STRIDE="${PI05_EVAL_VIDEO_STRIDE:-1}"
+VIDEO_OUTCOME_SUFFIX="${PI05_EVAL_VIDEO_OUTCOME_SUFFIX:-1}"
 
-RESULT_ROOT="${SCRIPT_DIR}/output"
-RUN_ID="${PI05_EVAL_RUN_ID:-pi05_fc000_fc009_$(date +%Y%m%d_%H%M%S)}"
+RESULT_ROOT="${PI05_EVAL_OUTPUT_ROOT:-${SCRIPT_DIR}/output/circular_motion/cm000_cm009/level2_fixed/server_scheduled}"
+RUN_ID="${PI05_EVAL_RUN_ID:-pi05_cm_id50_$(date +%Y%m%d_%H%M%S)}"
 RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
+OOD_LIGHTING="${PI05_EVAL_OOD_LIGHTING-0}"
 
 DEFAULT_TASK_IDS=(
-  fc_000
-  fc_001
-  fc_002
-  fc_003
-  fc_004
-  fc_005
-  fc_006
-  fc_007
-  fc_008
-  fc_009
+  cm_000
+  cm_001
+  cm_002
+  cm_003
+  cm_004
+  cm_005
+  cm_006
+  cm_007
+  cm_008
+  cm_009
 )
 
 if [[ -n "${PI05_EVAL_TASKS:-}" ]]; then
@@ -93,11 +95,11 @@ LAST_FAILURES=0
 LAST_SUCCESS_RATE=""
 
 log() {
-  printf '[PI05-FC000-FC009-EVAL] %s\n' "$*"
+  printf '[PI05-CM000-CM009-EVAL] %s\n' "$*"
 }
 
 die() {
-  printf '[PI05-FC000-FC009-EVAL] ERROR: %s\n' "$*" >&2
+  printf '[PI05-CM000-CM009-EVAL] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -125,9 +127,18 @@ require_uint_at_least() {
   fi
 }
 
+benchmark_max_steps() {
+  local benchmark_config="$1"
+  local configured=""
+  configured="$(awk '/^[[:space:]]*max_steps:[[:space:]]*[0-9]+[[:space:]]*$/ { print $2; exit }' "${benchmark_config}")"
+  [[ -n "${configured}" ]] || die "runtime.max_steps not found in benchmark: ${benchmark_config}"
+  printf '%s\n' "${configured}"
+}
+
 validate_checkpoint() {
   require_dir "${PI05_MODEL_PATH}"
   require_file "${PI05_MODEL_PATH}/config.json"
+  require_file "${PI05_MODEL_PATH}/train_config.json"
   require_file "${PI05_MODEL_PATH}/model.safetensors"
   require_file "${PI05_MODEL_PATH}/policy_preprocessor.json"
   require_file "${PI05_MODEL_PATH}/policy_postprocessor.json"
@@ -139,24 +150,80 @@ import json
 import sys
 from pathlib import Path
 
-config = json.loads((Path(sys.argv[1]) / "config.json").read_text())
+root = Path(sys.argv[1])
+config = json.loads((root / "config.json").read_text(encoding="utf-8"))
+train = json.loads((root / "train_config.json").read_text(encoding="utf-8"))
+preprocessor = json.loads((root / "policy_preprocessor.json").read_text(encoding="utf-8"))
+postprocessor = json.loads((root / "policy_postprocessor.json").read_text(encoding="utf-8"))
+
 expected_images = {
     "observation.images.overview": [3, 240, 320],
     "observation.images.front": [3, 240, 320],
     "observation.images.wrist": [3, 160, 160],
 }
+expected_input_keys = {"observation.state", *expected_images}
+expected_norm_map = {
+    "VISUAL": "IDENTITY",
+    "STATE": "QUANTILES",
+    "ACTION": "QUANTILES",
+}
+
 assert config.get("type") == "pi05", config.get("type")
+assert config.get("n_obs_steps") == 1, config.get("n_obs_steps")
 assert config.get("chunk_size") == 50, config.get("chunk_size")
 assert config.get("n_action_steps") == 50, config.get("n_action_steps")
 assert config.get("num_inference_steps") == 10, config.get("num_inference_steps")
 assert config.get("max_state_dim") == 32, config.get("max_state_dim")
 assert config.get("max_action_dim") == 32, config.get("max_action_dim")
 assert config.get("use_relative_actions") is False
-assert config.get("input_features", {}).get("observation.state", {}).get("shape") == [10]
+assert config.get("normalization_mapping") == expected_norm_map
+assert set(config.get("input_features", {})) == expected_input_keys
+assert config["input_features"]["observation.state"]["shape"] == [10]
 assert config.get("output_features", {}).get("action", {}).get("shape") == [10]
 for key, shape in expected_images.items():
-    assert config.get("input_features", {}).get(key, {}).get("shape") == shape, key
-' "${PI05_MODEL_PATH}" || die "checkpoint config does not match the trained PI0.5-FC contract"
+    assert config["input_features"][key]["shape"] == shape, key
+
+assert train.get("dataset", {}).get("repo_id") == "local/lerobot_cm_pi05_v30"
+assert train.get("steps") == 80000
+train_policy = train.get("policy", {})
+for key in (
+    "type", "n_obs_steps", "input_features", "output_features", "chunk_size",
+    "n_action_steps", "num_inference_steps", "max_state_dim", "max_action_dim",
+    "use_relative_actions", "normalization_mapping",
+):
+    assert train_policy.get(key) == config.get(key), key
+
+pre_steps = preprocessor.get("steps", [])
+post_steps = postprocessor.get("steps", [])
+assert [step.get("registry_name") for step in pre_steps] == [
+    "rename_observations_processor",
+    "to_batch_processor",
+    "relative_actions_processor",
+    "normalizer_processor",
+    "pi05_prepare_state_tokenizer_processor_step",
+    "tokenizer_processor",
+    "device_processor",
+]
+assert pre_steps[2].get("config", {}).get("enabled") is False
+assert pre_steps[3].get("config", {}).get("features") == {
+    **config["input_features"],
+    **config["output_features"],
+}
+assert pre_steps[3].get("config", {}).get("norm_map") == expected_norm_map
+assert pre_steps[3].get("state_file") == "policy_preprocessor_step_3_normalizer_processor.safetensors"
+assert pre_steps[5].get("config", {}).get("tokenizer_name") == "google/paligemma-3b-pt-224"
+assert pre_steps[5].get("config", {}).get("max_length") == config.get("tokenizer_max_length")
+assert [step.get("registry_name") for step in post_steps] == [
+    "unnormalizer_processor",
+    "absolute_actions_processor",
+    "device_processor",
+]
+assert post_steps[0].get("config", {}).get("features") == config["output_features"]
+assert post_steps[0].get("config", {}).get("norm_map") == expected_norm_map
+assert post_steps[0].get("state_file") == "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+assert post_steps[1].get("config", {}).get("enabled") is False
+assert post_steps[2].get("config", {}).get("device") == "cpu"
+' "${PI05_MODEL_PATH}" || die "checkpoint does not match the trained PI0.5-CM contract"
 }
 
 validate_runtime_imports() {
@@ -173,12 +240,52 @@ from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 ' || die "PI0.5 runtime imports failed; verify the LeRobot pi extra and pyzmq"
 }
 
+validate_bridge_contract() {
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${LEROBOT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PI05_PYTHON}" -c '
+import sys
+import inspect
+
+sys.path.insert(0, sys.argv[1])
+import motionforge_pi05_bridge_client as client
+from motionforge.benchmark.protocol import PROTOCOL
+
+assert PROTOCOL == "motionforge.server_scheduled"
+assert list(inspect.signature(client.PI05Inference.reset).parameters) == ["self", "reset"]
+assert list(inspect.signature(client.PI05Inference.predict).parameters) == [
+    "self",
+    "observation",
+]
+assert not hasattr(client, "MotionForgeTransport")
+assert not hasattr(client, "action_packet")
+' "${SCRIPT_DIR}" || die "PI0.5 bridge does not match the CM action contract"
+}
+
+validate_runtime_assets() {
+  require_file "${RUNTIME_ASSET_DIR}/environments/circular_motion/kitchen_rotary_room_01/derived/kitchen_rotary_room_01_visual.usda"
+  require_file "${RUNTIME_ASSET_DIR}/furniture/kitchen_islands/geniesim_table_03/derived/kitchen_island_table_03_visual.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/xuanyu/turntables/turntable_visual_smoked_glass_steel_v1/derived/turntable_visual_smoked_glass_steel_v1.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/mug_trees/kelcode_modular_mug_tree_01/derived/mug_tree_4_hook_articulation.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_rotating_test_tube_rack_opaque_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_test_tube_18x105_opaque_blue_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/lab/rotating_test_tube_rack_01/lab_test_tube_18x105_opaque_yellow_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/mechanisms/control_panels/rotating_three_button_panel_01/derived/rotating_three_button_panel_01.usda"
+  require_file "${RUNTIME_ASSET_DIR}/containers/baskets/wicker_basket_01/wicker_basket_01_rigid.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/puzzles/rubik_cube_01/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/fruit_snack_package/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/medicine_bottle/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/google_scanned_objects/classic_blue_mug/derived/graspable.usda"
+  require_file "${RUNTIME_ASSET_DIR}/objects/graspable_pool/polyhaven/rubber_duck/derived/graspable.usda"
+}
+
 validate_configuration() {
   local task_id=""
   local benchmark_config=""
+  local task_max_steps=""
 
   require_dir "${MOTIONFORGE_ROOT}"
   require_dir "${LEROBOT_ROOT}/src/lerobot"
+  require_dir "${BENCHMARK_DIR}"
   require_file "${BRIDGE_CLIENT}"
   require_file "${TRIALS_SERVER}"
   require_executable "${PI05_PYTHON}"
@@ -192,18 +299,28 @@ validate_configuration() {
   command -v grep >/dev/null 2>&1 || die "required executable not found: grep"
   validate_checkpoint
   validate_runtime_imports
+  validate_bridge_contract
+  validate_runtime_assets
+
+  [[ "${MOTIONFORGE_DEVICE}" == "cpu" ]] || die \
+    "MOTIONFORGE_DEVICE must be cpu for CM evaluation; GPU PhysX makes rotating compound/articulated payloads sink"
+  [[ "${INITIAL_POSITION_MODE}" == "fixed" ]] || die \
+    "PI05_EVAL_INITIAL_POSITION_MODE must be fixed for the base CM evaluation"
+  [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]] || die \
+    "PI05_EVAL_USE_BENCHMARK_MAX_STEPS must be 1 for CM evaluation"
 
   ((${#TASK_IDS[@]} > 0)) || die "PI05_EVAL_TASKS must select at least one task"
   for task_id in "${TASK_IDS[@]}"; do
-    [[ "${task_id}" =~ ^fc_00[0-9]$ ]] || die "invalid FC task id: ${task_id}"
+    [[ "${task_id}" =~ ^cm_(00[0-9]|010)$ ]] || die "invalid CM task id: ${task_id}"
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
     require_file "${benchmark_config}"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
+    require_uint_at_least "${task_id} max_steps" "${task_max_steps}" 1
   done
 
   require_uint_at_least "PI05_EVAL_START_SEED" "${START_SEED}" 0
   require_uint_at_least "PI05_EVAL_NUM_TRIALS" "${NUM_TRIALS}" 1
   require_uint_at_least "MOTIONFORGE_ATTEMPTS_PER_WORKER" "${ATTEMPTS_PER_WORKER}" 1
-  require_uint_at_least "PI05_EVAL_MAX_STEPS" "${MAX_STEPS}" 1
   require_uint_at_least "PI05_EVAL_OBS_PORT" "${OBS_PORT}" 1
   require_uint_at_least "PI05_EVAL_ACT_PORT" "${ACT_PORT}" 1
   require_uint_at_least "PI05_EVAL_CLIENT_READY_TIMEOUT_S" "${CLIENT_READY_TIMEOUT_S}" 1
@@ -217,12 +334,16 @@ validate_configuration() {
   ((10#${ACT_PORT} <= 65535)) || die "PI05_EVAL_ACT_PORT must be <= 65535"
   [[ "${OBS_PORT}" != "${ACT_PORT}" ]] || die "observation and action ports must differ"
   [[ "${DRY_RUN}" == "0" || "${DRY_RUN}" == "1" ]] || die "DRY_RUN must be 0 or 1"
-  [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" || "${USE_BENCHMARK_MAX_STEPS}" == "1" ]] \
-    || die "PI05_EVAL_USE_BENCHMARK_MAX_STEPS must be 0 or 1"
+  [[ "${OOD_LIGHTING}" == "0" || "${OOD_LIGHTING}" == "1" ]] \
+    || die "PI05_EVAL_OOD_LIGHTING must be 0 or 1"
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "lighting OOD requires all trial seeds to be in 0-49"
+  fi
+  [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
+    || die "PI05_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
   [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
     || die "PI05_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
-  [[ "${INITIAL_POSITION_MODE}" == "fixed" || "${INITIAL_POSITION_MODE}" == "seeded" ]] \
-    || die "PI05_EVAL_INITIAL_POSITION_MODE must be fixed or seeded"
   [[ -n "${PI05_TOKENIZER_PATH}" ]] || die "PI05_TOKENIZER_PATH must not be empty"
   [[ "${PI05_EVAL_CUDA_VISIBLE_DEVICES}" =~ ^[0-9]+$ ]] \
     || die "PI05_EVAL_CUDA_VISIBLE_DEVICES must select exactly one CUDA device index"
@@ -291,7 +412,6 @@ build_commands() {
     "${video_dir}"
     --video_name
     "${video_name}"
-    --video_outcome_suffix
     --video_width
     "${VIDEO_WIDTH}"
     --video_height
@@ -299,12 +419,14 @@ build_commands() {
     --video_stride
     "${VIDEO_STRIDE}"
   )
-
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "0" ]]; then
-    SERVER_COMMAND+=(--max_steps "${MAX_STEPS}")
-  fi
   if [[ -n "${MOTION_LEVEL}" ]]; then
     SERVER_COMMAND+=(--motion_level "${MOTION_LEVEL}")
+  fi
+  if [[ "${OOD_LIGHTING}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_lighting)
+  fi
+  if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+    SERVER_COMMAND+=(--video_outcome_suffix)
   fi
 
   BRIDGE_COMMAND=(
@@ -434,6 +556,7 @@ parse_task_summary() {
   LAST_SUCCESS_RATE="${BASH_REMATCH[4]}"
   ((10#${LAST_TRIALS} == 10#${NUM_TRIALS})) || return 1
   ((10#${LAST_SUCCESSES} + 10#${LAST_FAILURES} == 10#${LAST_TRIALS})) || return 1
+  return 0
 }
 
 count_videos() {
@@ -449,40 +572,46 @@ validate_video_outputs() {
   local task_id="$1"
   local video_dir="$2"
   local trial_number=0
-  local base_video_path=""
-  local success_video_path=""
-  local failure_video_path=""
+  local video_path=""
+  local success_path=""
+  local failure_path=""
+
   for ((trial_number = 1; trial_number <= 10#${NUM_TRIALS}; trial_number++)); do
     if ((10#${NUM_TRIALS} == 1)); then
-      base_video_path="${video_dir}/${task_id}_rollout.mp4"
+      video_path="${video_dir}/${task_id}_rollout.mp4"
     else
-      printf -v base_video_path '%s/%s_rollout_trial_%03d.mp4' \
-        "${video_dir}" "${task_id}" "${trial_number}"
+      printf -v video_path '%s/%s_rollout_trial_%03d.mp4' "${video_dir}" "${task_id}" "${trial_number}"
     fi
-    success_video_path="${base_video_path%.mp4}_success.mp4"
-    failure_video_path="${base_video_path%.mp4}_failure.mp4"
-    if [[ -s "${success_video_path}" ]]; then
-      [[ ! -e "${failure_video_path}" ]] || return 1
-    elif [[ -s "${failure_video_path}" ]]; then
-      [[ ! -e "${success_video_path}" ]] || return 1
-    else
+    if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
+      success_path="${video_path%.mp4}_success.mp4"
+      failure_path="${video_path%.mp4}_failure.mp4"
+      if [[ -s "${success_path}" && ! -e "${failure_path}" ]]; then
+        continue
+      fi
+      if [[ -s "${failure_path}" && ! -e "${success_path}" ]]; then
+        continue
+      fi
       return 1
     fi
+    [[ -s "${video_path}" ]] || return 1
   done
+  return 0
 }
 
 append_task_result() {
   local task_id="$1"
   local status="$2"
   local benchmark_config="$3"
-  local video_dir="$4"
-  local reason="$5"
+  local task_max_steps="$4"
+  local video_dir="$5"
+  local reason="$6"
   local video_count=""
   video_count="$(count_videos "${video_dir}")"
   {
     printf '\n[%s]\n' "${task_id}"
     printf 'status=%s\n' "${status}"
     printf 'benchmark=%s\n' "${benchmark_config}"
+    printf 'max_steps=%s\n' "${task_max_steps}"
     printf 'trials=%s\n' "${LAST_TRIALS:-N/A}"
     printf 'successes=%s\n' "${LAST_SUCCESSES:-N/A}"
     printf 'failures=%s\n' "${LAST_FAILURES:-N/A}"
@@ -496,26 +625,25 @@ append_task_result() {
 run_task() {
   local task_id="$1"
   local benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+  local task_max_steps=""
   local task_result_dir="${RESULT_DIR}/${task_id}"
   local server_log="${task_result_dir}/server.log"
   local client_log="${task_result_dir}/client.log"
   local video_dir="${task_result_dir}/videos"
   local process_status=0
-  local max_steps_label="${MAX_STEPS}"
 
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  fi
-
+  task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
   LAST_TRIALS=0
   LAST_SUCCESSES=0
   LAST_FAILURES=0
   LAST_SUCCESS_RATE=""
   mkdir -p "${video_dir}" || return 1
   build_commands "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label}" \
+  log "starting task=${task_id} trials=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${task_max_steps}" \
     "motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE}" \
     "seeds=${START_SEED}-$((START_SEED + NUM_TRIALS - 1))"
+  log "server_log=${server_log}"
+  log "client_log=${client_log}"
 
   (
     cd -- "${LEROBOT_ROOT}"
@@ -532,7 +660,7 @@ run_task() {
   set -e
   if ((process_status != 0)); then
     cleanup_processes
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "bridge failed to become ready within ${CLIENT_READY_TIMEOUT_S}s"
     return "${process_status}"
   fi
@@ -552,22 +680,23 @@ run_task() {
     process_status="$?"
   fi
   if ((process_status != 0)); then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server/client process exit status ${process_status}"
     return "${process_status}"
   fi
   if ! parse_task_summary "${server_log}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
       "server log has no valid ${NUM_TRIALS}-trial summary"
     return 1
   fi
   if ! validate_video_outputs "${task_id}" "${video_dir}"; then
-    append_task_result "${task_id}" failed "${benchmark_config}" "${video_dir}" \
-      "expected ${NUM_TRIALS} non-empty rollout videos"
+    append_task_result "${task_id}" failed "${benchmark_config}" "${task_max_steps}" "${video_dir}" \
+      "expected ${NUM_TRIALS} non-empty rollout videos with unambiguous outcome suffixes"
     return 1
   fi
-  append_task_result "${task_id}" completed "${benchmark_config}" "${video_dir}" "none"
+  append_task_result "${task_id}" completed "${benchmark_config}" "${task_max_steps}" "${video_dir}" "none"
   log "completed task=${task_id} successes=${LAST_SUCCESSES}/${LAST_TRIALS} success_rate=${LAST_SUCCESS_RATE}"
+  return 0
 }
 
 append_overall_summary() {
@@ -579,15 +708,15 @@ append_overall_summary() {
   local expected_tasks="${#TASK_IDS[@]}"
   local expected_trials=$((expected_tasks * NUM_TRIALS))
   local total_success_rate="N/A"
+  local partial_success_rate="N/A"
   local overall_status="incomplete"
+
   if ((completed_trials > 0)); then
-    total_success_rate="$(
-      awk -v successes="${total_successes}" -v trials="${completed_trials}" \
-        'BEGIN { printf "%.3f", successes / trials }'
-    )"
+    partial_success_rate="$(awk -v successes="${total_successes}" -v trials="${completed_trials}" 'BEGIN { printf "%.3f", successes / trials }')"
   fi
   if ((completed_tasks == expected_tasks && failed_tasks == 0 && completed_trials == expected_trials)); then
     overall_status="completed"
+    total_success_rate="${partial_success_rate}"
   fi
   {
     printf '\n[overall]\n'
@@ -600,6 +729,7 @@ append_overall_summary() {
     printf 'total_successes=%s\n' "${total_successes}"
     printf 'total_failures=%s\n' "${total_failures}"
     printf 'total_success_rate=%s\n' "${total_success_rate}"
+    printf 'partial_success_rate=%s\n' "${partial_success_rate}"
     printf 'finished_at=%s\n' "$(date --iso-8601=seconds)"
   } >>"${SUMMARY_FILE}"
 }
@@ -607,23 +737,19 @@ append_overall_summary() {
 validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
+  log "ood_lighting=${OOD_LIGHTING}"
   log "validated configuration; no process or result directory will be created"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    max_steps_label="benchmark_config"
-  else
-    max_steps_label="${MAX_STEPS}"
-  fi
-  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=${max_steps_label}" \
-    "motion_level=${MOTION_LEVEL:-benchmark_config} initial_position_mode=${INITIAL_POSITION_MODE}" \
-    "timing=benchmark_config" \
-    "bridge_ready_timeout_s=${CLIENT_READY_TIMEOUT_S}"
+  log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config" \
+    "timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE}" \
+    "video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "model=${PI05_MODEL_PATH} tokenizer=${PI05_TOKENIZER_PATH}" \
     "result_dir=${RESULT_DIR} policy_seed=server_reset"
   for task_id in "${TASK_IDS[@]}"; do
     benchmark_config="${BENCHMARK_DIR}/${task_id}_rgb_gr00t_zmq.yaml"
+    task_max_steps="$(benchmark_max_steps "${benchmark_config}")"
     video_dir="${RESULT_DIR}/${task_id}/videos"
     build_commands "${benchmark_config}" "${video_dir}" "${task_id}_rollout.mp4"
-    log "dry-run task=${task_id} benchmark=${benchmark_config}"
+    log "dry-run task=${task_id} max_steps=${task_max_steps} benchmark=${benchmark_config}"
     print_command "${MOTIONFORGE_ROOT}" "${SERVER_COMMAND[@]}"
     print_bridge_command
   done
@@ -635,35 +761,34 @@ if [[ -e "${RESULT_DIR}" ]]; then
 fi
 mkdir -p "${RESULT_DIR}"
 {
-  printf 'PI0.5 FC000-FC009 MotionForge evaluation\n'
+  printf 'PI0.5 CM000-CM009 MotionForge evaluation\n'
   printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
   printf 'model=%s\n' "${PI05_MODEL_PATH}"
   printf 'tokenizer=%s\n' "${PI05_TOKENIZER_PATH}"
   printf 'device=%s\n' "${PI05_DEVICE}"
-  printf 'motionforge_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
+  printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
   printf 'cuda_visible_devices=%s\n' "${PI05_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'policy_seed=%s\n' 'server_reset'
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
+  printf 'task_ids=%s\n' "${TASK_IDS[*]}"
   printf 'trials_per_task=%s\n' "${NUM_TRIALS}"
   printf 'attempts_per_worker=%s\n' "${ATTEMPTS_PER_WORKER}"
-  if [[ "${USE_BENCHMARK_MAX_STEPS}" == "1" ]]; then
-    printf 'max_steps_per_trial=benchmark_config\n'
-  else
-    printf 'max_steps_per_trial=%s\n' "${MAX_STEPS}"
-  fi
+  printf 'max_steps_source=benchmark_config\n'
+  printf 'timing_source=benchmark_config\n'
   printf 'motion_level=%s\n' "${MOTION_LEVEL:-benchmark_config}"
   printf 'seed_start=%s\n' "${START_SEED}"
   printf 'seed_end=%s\n' "$((START_SEED + NUM_TRIALS - 1))"
   printf 'initial_position_mode=%s\n' "${INITIAL_POSITION_MODE}"
-  printf 'timing_source=benchmark_config\n'
+  printf 'n_obs_steps=1\n'
   printf 'action_horizon=50\n'
   printf 'num_inference_steps=10\n'
   printf 'bridge_ready_timeout_s=%s\n' "${CLIENT_READY_TIMEOUT_S}"
   printf 'video_enabled=true\n'
-  printf 'video_outcome_suffix=true\n'
   printf 'video_width=%s\n' "${VIDEO_WIDTH}"
   printf 'video_height=%s\n' "${VIDEO_HEIGHT}"
   printf 'video_stride=%s\n' "${VIDEO_STRIDE}"
+  printf 'video_outcome_suffix=%s\n' "${VIDEO_OUTCOME_SUFFIX}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0
