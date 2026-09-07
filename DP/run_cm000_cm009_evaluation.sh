@@ -29,6 +29,7 @@ TIMEOUT_EXE="${MOTIONFORGE_TIMEOUT_EXE:-$(command -v timeout || true)}"
 
 START_SEED="${DIFFUSION_EVAL_START_SEED:-0}"
 NUM_TRIALS="${DIFFUSION_EVAL_NUM_TRIALS:-50}"
+MOTION_LEVEL="${DIFFUSION_EVAL_MOTION_LEVEL:-}"
 ATTEMPTS_PER_WORKER="${MOTIONFORGE_ATTEMPTS_PER_WORKER:-50}"
 OBS_PORT="${DIFFUSION_EVAL_OBS_PORT:-3396}"
 DIFFUSION_PORT="${DIFFUSION_EVAL_DIFFUSION_PORT:-3398}"
@@ -46,6 +47,7 @@ RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
 OOD_LIGHTING="${DIFFUSION_EVAL_OOD_LIGHTING-0}"
+OOD_SPEED="${DIFFUSION_EVAL_OOD_SPEED-0}"
 
 DEFAULT_TASK_IDS=(
   cm_000
@@ -260,6 +262,16 @@ validate_configuration() {
     ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
       || die "lighting OOD requires all trial seeds to be in 0-49"
   fi
+  [[ "${OOD_SPEED}" == "0" || "${OOD_SPEED}" == "1" ]] \
+    || die "DIFFUSION_EVAL_OOD_SPEED must be 0 or 1"
+  if [[ "${OOD_SPEED}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "speed OOD requires all trial seeds to be in 0-49"
+    [[ -z "${MOTION_LEVEL}" ]] \
+      || die "DIFFUSION_EVAL_OOD_SPEED cannot be combined with DIFFUSION_EVAL_MOTION_LEVEL"
+  fi
+  [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
+    || die "DIFFUSION_EVAL_MOTION_LEVEL must be empty, level1, level2, or level3"
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
     || die "DIFFUSION_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
   require_uint_at_least \
@@ -346,6 +358,12 @@ build_commands() {
   )
   if [[ "${OOD_LIGHTING}" == "1" ]]; then
     SERVER_COMMAND+=(--ood_lighting)
+  fi
+  if [[ "${OOD_SPEED}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_speed)
+  fi
+  if [[ -n "${MOTION_LEVEL}" ]]; then
+    SERVER_COMMAND+=(--motion_level "${MOTION_LEVEL}")
   fi
   if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
     SERVER_COMMAND+=(--video_outcome_suffix)
@@ -617,6 +635,8 @@ validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "ood_lighting=${OOD_LIGHTING}"
+  log "ood_speed=${OOD_SPEED}"
+  log "motion_level=${MOTION_LEVEL:-benchmark_config}"
   log "validated configuration; no process or result directory will be created"
   log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE} num_inference_steps=${DIFFUSION_NUM_INFERENCE_STEPS} video_outcome_suffix=${VIDEO_OUTCOME_SUFFIX} expected_trials=$((${#TASK_IDS[@]} * NUM_TRIALS))"
   log "model=${DIFFUSION_MODEL_PATH} result_dir=${RESULT_DIR} policy_seed=server_reset"
@@ -643,6 +663,8 @@ mkdir -p "${RESULT_DIR}"
   printf 'device=%s\n' "${DIFFUSION_DEVICE}"
   printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
   printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
+  printf 'ood_speed=%s\n' "${OOD_SPEED}"
+  printf 'motion_level=%s\n' "${MOTION_LEVEL:-benchmark_config}"
   printf 'cuda_visible_devices=%s\n' "${DIFFUSION_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'policy_seed=%s\n' 'server_reset'
   printf 'num_inference_steps=%s\n' "${DIFFUSION_NUM_INFERENCE_STEPS}"
@@ -666,6 +688,7 @@ mkdir -p "${RESULT_DIR}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0
+task_status=0
 completed_tasks=0
 failed_tasks=0
 completed_trials=0
@@ -679,8 +702,12 @@ for task_id in "${TASK_IDS[@]}"; do
     total_successes=$((total_successes + LAST_SUCCESSES))
     total_failures=$((total_failures + LAST_FAILURES))
   else
+    task_status=$?
     overall_status=1
     ((failed_tasks += 1))
+    cleanup_processes
+    log "failed task=${task_id} exit_code=${task_status}; continuing immediately with the next task"
+    continue
   fi
   cleanup_processes
   if [[ "${task_id}" != "${TASK_IDS[-1]}" ]] && ((10#${BETWEEN_TASKS_S} > 0)); then

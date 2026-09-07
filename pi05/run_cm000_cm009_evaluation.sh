@@ -64,6 +64,7 @@ RESULT_DIR="${RESULT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RESULT_DIR}/success_rates.txt"
 DRY_RUN="${DRY_RUN:-0}"
 OOD_LIGHTING="${PI05_EVAL_OOD_LIGHTING-0}"
+OOD_SPEED="${PI05_EVAL_OOD_SPEED-0}"
 
 DEFAULT_TASK_IDS=(
   cm_000
@@ -340,6 +341,14 @@ validate_configuration() {
     ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
       || die "lighting OOD requires all trial seeds to be in 0-49"
   fi
+  [[ "${OOD_SPEED}" == "0" || "${OOD_SPEED}" == "1" ]] \
+    || die "PI05_EVAL_OOD_SPEED must be 0 or 1"
+  if [[ "${OOD_SPEED}" == "1" ]]; then
+    ((10#${START_SEED} < 50 && 10#${NUM_TRIALS} <= 50 - 10#${START_SEED})) \
+      || die "speed OOD requires all trial seeds to be in 0-49"
+    [[ -z "${MOTION_LEVEL}" ]] \
+      || die "PI05_EVAL_OOD_SPEED cannot be combined with PI05_EVAL_MOTION_LEVEL"
+  fi
   [[ "${VIDEO_OUTCOME_SUFFIX}" == "0" || "${VIDEO_OUTCOME_SUFFIX}" == "1" ]] \
     || die "PI05_EVAL_VIDEO_OUTCOME_SUFFIX must be 0 or 1"
   [[ -z "${MOTION_LEVEL}" || "${MOTION_LEVEL}" =~ ^level[123]$ ]] \
@@ -424,6 +433,9 @@ build_commands() {
   fi
   if [[ "${OOD_LIGHTING}" == "1" ]]; then
     SERVER_COMMAND+=(--ood_lighting)
+  fi
+  if [[ "${OOD_SPEED}" == "1" ]]; then
+    SERVER_COMMAND+=(--ood_speed)
   fi
   if [[ "${VIDEO_OUTCOME_SUFFIX}" == "1" ]]; then
     SERVER_COMMAND+=(--video_outcome_suffix)
@@ -738,6 +750,7 @@ validate_configuration
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "ood_lighting=${OOD_LIGHTING}"
+  log "ood_speed=${OOD_SPEED}"
   log "validated configuration; no process or result directory will be created"
   log "tasks=${#TASK_IDS[@]} trials_per_task=${NUM_TRIALS} attempts_per_worker=${ATTEMPTS_PER_WORKER} max_steps=benchmark_config" \
     "timing=benchmark_config physics_device=${MOTIONFORGE_DEVICE}" \
@@ -768,6 +781,7 @@ mkdir -p "${RESULT_DIR}"
   printf 'device=%s\n' "${PI05_DEVICE}"
   printf 'motionforge_physics_device=%s\n' "${MOTIONFORGE_DEVICE}"
   printf 'ood_lighting=%s\n' "${OOD_LIGHTING}"
+  printf 'ood_speed=%s\n' "${OOD_SPEED}"
   printf 'cuda_visible_devices=%s\n' "${PI05_EVAL_CUDA_VISIBLE_DEVICES}"
   printf 'policy_seed=%s\n' 'server_reset'
   printf 'tasks=%s\n' "${#TASK_IDS[@]}"
@@ -792,6 +806,7 @@ mkdir -p "${RESULT_DIR}"
 } >"${SUMMARY_FILE}"
 
 overall_status=0
+task_status=0
 completed_tasks=0
 failed_tasks=0
 completed_trials=0
@@ -805,8 +820,12 @@ for task_id in "${TASK_IDS[@]}"; do
     total_successes=$((total_successes + LAST_SUCCESSES))
     total_failures=$((total_failures + LAST_FAILURES))
   else
+    task_status=$?
     overall_status=1
     ((failed_tasks += 1))
+    cleanup_processes
+    log "failed task=${task_id} exit_code=${task_status}; continuing immediately with the next task"
+    continue
   fi
   cleanup_processes
   if [[ "${task_id}" != "${TASK_IDS[-1]}" ]] && ((10#${BETWEEN_TASKS_S} > 0)); then
